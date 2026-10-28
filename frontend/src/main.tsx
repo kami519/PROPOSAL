@@ -4,13 +4,17 @@ import '@fontsource-variable/space-grotesk'
 import './index.css'
 import './workbench.css'
 import './library.css'
+import './tasks.css'
 import App from './App.tsx'
 import { ToastProvider } from './context/ToastContext'
+import { SummaryQueueProvider } from './context/SummaryQueueContext'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ToastProvider>
-      <App />
+      <SummaryQueueProvider>
+        <App />
+      </SummaryQueueProvider>
     </ToastProvider>
   </StrictMode>,
 )

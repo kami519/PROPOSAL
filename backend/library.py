@@ -396,7 +396,7 @@ class LibraryStore:
         row = self.raw(note_id_value)
         if row is None:
             return None
-        if row["status"] in {"processing", "error"} and row["draft_path"]:
+        if row["status"] in {"processing", "error", "cancelled"} and row["draft_path"]:
             draft = absolute_path(row["draft_path"])
             if draft and draft.is_file():
                 return draft

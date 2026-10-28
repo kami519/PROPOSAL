@@ -264,6 +264,24 @@ _正在生成完整文案…_
                 draft_path=relative_path(self.draft_path),
             )
 
+    def cancel(self, message: str) -> None:
+        """Keep the draft viewable but mark it as cancelled, not failed."""
+
+        with self._lock:
+            text = self._read()
+            if text:
+                data, body = parse_frontmatter(text)
+                data["status"] = "cancelled"
+                data["error"] = message
+                data["updated_at"] = now_iso()
+                self._write(render_frontmatter(data) + "\n" + body.lstrip("\n"))
+            self.library.update(
+                self.note_id,
+                status="cancelled",
+                error=message,
+                draft_path=relative_path(self.draft_path),
+            )
+
     def content(self) -> str:
         path = self.final_path if self.final_path.is_file() else self.draft_path
         return path.read_text(encoding="utf-8") if path.is_file() else ""

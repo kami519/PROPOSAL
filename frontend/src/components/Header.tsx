@@ -1,14 +1,17 @@
 import { useEffect, useState } from 'react'
 import { Menu, X } from 'lucide-react'
+import { useSummaryQueue } from '../context/SummaryQueueContext'
 import { BrandMark } from './BrandMark'
 
 const NAV_ITEMS = [
+  { href: '#/tasks', label: '任务中心' },
   { href: '#/library', label: '笔记仓库' },
   { href: '#platforms', label: '支持平台' },
   { href: '#faq', label: '常见问题' },
 ]
 
 export function Header() {
+  const { activeCount } = useSummaryQueue()
   const [menuOpen, setMenuOpen] = useState(false)
 
   useEffect(() => {
@@ -33,6 +36,9 @@ export function Header() {
           {NAV_ITEMS.map((item) => (
             <a key={item.href} href={item.href}>
               {item.label}
+              {item.href === '#/tasks' && activeCount > 0 ? (
+                <span className="nav-badge">{activeCount}</span>
+              ) : null}
             </a>
           ))}
         </nav>
@@ -59,6 +65,9 @@ export function Header() {
           {NAV_ITEMS.map((item) => (
             <a key={item.href} href={item.href} onClick={() => setMenuOpen(false)}>
               {item.label}
+              {item.href === '#/tasks' && activeCount > 0 ? (
+                <span className="nav-badge">{activeCount}</span>
+              ) : null}
             </a>
           ))}
         </div>

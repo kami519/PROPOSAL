@@ -86,17 +86,25 @@ export interface SummaryResult {
   fallback?: boolean
 }
 
-export type SummaryStatus = 'queued' | 'processing' | 'done' | 'error'
-export type ArticleStatus = 'idle' | 'processing' | 'done' | 'error'
+export type SummaryStatus =
+  | 'queued'
+  | 'processing'
+  | 'cancelling'
+  | 'cancelled'
+  | 'done'
+  | 'error'
+export type ArticleStatus = 'idle' | 'processing' | 'done' | 'error' | 'cancelled'
 
 export interface SummaryJob {
   id: string
+  url?: string
   status: SummaryStatus
   stage: string
   progress: number
   title: string
   thumbnail: string | null
   platform: string | null
+  uploader?: string | null
   duration: number
   transcriptSource: 'subtitle' | 'audio' | null
   transcriptAvailable?: boolean
@@ -109,11 +117,38 @@ export interface SummaryJob {
   noteId?: string | null
   error: string | null
   errorCode: string | null
+  queuePosition?: number
+  transcribeQueuePosition?: number
+  canCancel?: boolean
+  canRetry?: boolean
+  deduped?: boolean
+  hasResult?: boolean
+  tldr?: string
+  retryCount?: number
+  startedAt?: number | null
+  finishedAt?: number | null
   createdAt: number
   updatedAt: number
 }
 
-export type LibraryStatus = 'processing' | 'done' | 'error' | 'trashed'
+export type SummaryTaskStatus = 'analyzing' | SummaryStatus
+
+export interface SummaryTask extends Omit<SummaryJob, 'status'> {
+  status: SummaryTaskStatus
+  url: string
+  addedAt?: number
+  localError?: string | null
+}
+
+export interface SummaryListResponse {
+  items: SummaryJob[]
+  active: number
+  queued: number
+  maxActive: number
+  maxQueue: number
+}
+
+export type LibraryStatus = 'processing' | 'done' | 'error' | 'cancelled' | 'trashed'
 
 export interface LibraryNote {
   id: string
@@ -172,6 +207,10 @@ export interface Health {
   summaryModel?: string
   articleEnabled?: boolean
   whisperAvailable: boolean
+  summaryActive?: number
+  summaryWorkers?: number
+  transcribeWorkers?: number
+  llmConcurrency?: number
 }
 
 export type LoadPhase = 'idle' | 'analyzing' | 'ready' | 'downloading' | 'cancelled' | 'done' | 'error'

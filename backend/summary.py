@@ -5,6 +5,7 @@ import html
 import importlib.util
 import json
 import logging
+import random
 import re
 import shutil
 import subprocess
@@ -27,12 +28,21 @@ from .config import (
     SUMMARY_API_KEY,
     SUMMARY_ARTICLE_ENABLED,
     SUMMARY_ARTICLE_MAX_CHARS,
+    SUMMARY_ARTICLE_WORKERS,
     SUMMARY_CACHE_TTL_SECONDS,
     SUMMARY_ENABLED,
+    SUMMARY_JOB_TTL_SECONDS,
+    SUMMARY_LLM_BACKOFF_SECONDS,
+    SUMMARY_LLM_CONCURRENCY,
+    SUMMARY_LLM_RETRIES,
     SUMMARY_MAX_CHARS,
     SUMMARY_MAX_DURATION_SECONDS,
+    SUMMARY_MAX_JOBS,
     SUMMARY_MODEL,
+    SUMMARY_PERSIST_JOBS,
+    SUMMARY_QUEUE_MAX,
     SUMMARY_TIMEOUT_SECONDS,
+    SUMMARY_TRANSCRIBE_WORKERS,
     SUMMARY_WORKERS,
     WHISPER_COMPUTE_TYPE,
     WHISPER_DEVICE,
@@ -45,7 +55,7 @@ from .downloader import (
     _find_output,
     _friendly_error,
 )
-from .errors import AppError
+from .errors import AppError, SummaryCancelled
 from .formats import human_duration
 from .library import LibraryStore, library_store
 from .note_writer import NoteWriter
@@ -56,13 +66,18 @@ SUMMARY_DIR = CACHE_DIR / "summaries"
 SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
 SUMMARY_CACHE_DIR = CACHE_DIR / "summary-cache"
 SUMMARY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARY_JOBS_PATH = CACHE_DIR / "summary-jobs.json"
 
 SUMMARY_PROMPT_VERSION = "2026-10-28.1"
 ARTICLE_PROMPT_VERSION = "2026-10-28.1"
 
 _whisper_model = None
 _whisper_lock = threading.Lock()
-_transcribe_lock = threading.Lock()
+# Transcription is CPU-bound and LLM calls are network-bound; they need
+# separate limits. The semaphores are process-wide so every SummaryStore
+# instance in this process shares the same guard rails.
+_transcribe_slots = threading.BoundedSemaphore(SUMMARY_TRANSCRIBE_WORKERS)
+_llm_slots = threading.BoundedSemaphore(SUMMARY_LLM_CONCURRENCY)
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 
@@ -306,9 +321,19 @@ def _subtitle_priority(path: Path) -> tuple[int, str]:
     return (1, name)
 
 
-def fetch_subtitle_text(url: str, directory: Path) -> str | None:
+def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise SummaryCancelled()
+
+
+def fetch_subtitle_text(
+    url: str,
+    directory: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> str | None:
     """Download the first usable subtitle track without downloading the video."""
 
+    _raise_if_cancelled(should_cancel)
     directory.mkdir(parents=True, exist_ok=True)
     adapter = YdlLogger()
     opts = _base_opts(adapter, outtmpl=str(directory / "sub.%(id)s.%(ext)s"))
@@ -324,6 +349,8 @@ def fetch_subtitle_text(url: str, directory: Path) -> str | None:
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
+    except SummaryCancelled:
+        raise
     except DownloadError as exc:
         logger.info("Subtitle extraction failed, falling back to audio: %s", str(exc)[:300])
         return None
@@ -331,12 +358,14 @@ def fetch_subtitle_text(url: str, directory: Path) -> str | None:
         logger.warning("Subtitle extraction failed: %s", str(exc)[:300])
         return None
 
+    _raise_if_cancelled(should_cancel)
     files = [
         path
         for path in directory.iterdir()
         if path.is_file() and path.suffix.lower() in {".vtt", ".srt", ".json", ".json3"}
     ]
     for path in sorted(files, key=_subtitle_priority):
+        _raise_if_cancelled(should_cancel)
         transcript = parse_subtitle_file(path)
         if len(transcript.strip()) >= 12:
             return transcript
@@ -347,6 +376,7 @@ def download_audio_for_summary(
     url: str,
     directory: Path,
     progress: Callable[..., None],
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Path:
     """Download only the audio stream for transcription.
 
@@ -355,6 +385,7 @@ def download_audio_for_summary(
     one transcode out of the slow path.
     """
 
+    _raise_if_cancelled(should_cancel)
     directory.mkdir(parents=True, exist_ok=True)
     adapter = YdlLogger()
     opts = _base_opts(adapter, outtmpl=str(directory / "audio.%(ext)s"))
@@ -364,6 +395,7 @@ def download_audio_for_summary(
 
     def on_progress(data: dict[str, Any]) -> None:
         nonlocal last_percent
+        _raise_if_cancelled(should_cancel)
         status = data.get("status")
         if status == "downloading":
             total = data.get("total_bytes") or data.get("total_bytes_estimate")
@@ -380,10 +412,14 @@ def download_audio_for_summary(
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
+    except SummaryCancelled:
+        raise
     except DownloadError as exc:
         raise _friendly_error(exc, adapter) from exc
     except Exception as exc:  # noqa: BLE001 - map to a user-facing error
         raise _friendly_error(exc, adapter) from exc
+
+    _raise_if_cancelled(should_cancel)
 
     audio_suffixes = {".m4a", ".mp3", ".webm", ".opus", ".ogg", ".wav", ".aac", ".mp4"}
     candidates = [
@@ -466,11 +502,30 @@ def transcribe_audio(
     path: Path,
     progress: Callable[[float], None],
     on_segment: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    on_start: Callable[[], None] | None = None,
 ) -> str:
-    model = _load_whisper_model()
-    audio = _decode_audio(path)
-    duration = len(audio) / 16000
-    with _transcribe_lock:
+    """Transcribe with a process-wide Whisper concurrency limit.
+
+    Decoding is kept inside the slot as well: a one-hour 16 kHz float32 buffer
+    is roughly 230 MB, so parallel decoding would multiply memory use before
+    Whisper even starts. The slot is acquired with a short timeout so a waiting
+    task can still respond to cancellation.
+    """
+
+    acquired = False
+    segments = None
+    try:
+        while True:
+            _raise_if_cancelled(should_cancel)
+            if _transcribe_slots.acquire(timeout=0.5):
+                acquired = True
+                break
+        if on_start is not None:
+            on_start()
+        model = _load_whisper_model()
+        audio = _decode_audio(path)
+        duration = len(audio) / 16000
         segments, _info = model.transcribe(
             audio,
             language=None,
@@ -480,6 +535,7 @@ def transcribe_audio(
         )
         entries: list[str] = []
         for segment in segments:
+            _raise_if_cancelled(should_cancel)
             text = _clean_subtitle_text(segment.text)
             if text:
                 line = f"[{_clock(segment.start)}] {text}"
@@ -488,7 +544,15 @@ def transcribe_audio(
                     on_segment(line)
             if duration:
                 progress(min(99.0, float(segment.end) / duration * 100))
-    return "\n".join(entries)
+        return "\n".join(entries)
+    finally:
+        if segments is not None:
+            try:
+                segments.close()
+            except Exception:  # noqa: BLE001 - generator cleanup is best effort
+                pass
+        if acquired:
+            _transcribe_slots.release()
 
 
 def _chunk_text(text: str, size: int) -> list[str]:
@@ -552,7 +616,26 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise AppError("SUMMARY_FORMAT_ERROR", "AI 返回的总结格式不正确，请重试。", 502)
 
 
-def _chat(messages: list[dict[str, str]], max_tokens: int = 2200) -> str:
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _retry_wait_seconds(attempt: int, response: httpx.Response | None = None) -> float:
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(30.0, max(0.5, float(retry_after)))
+            except (TypeError, ValueError):
+                pass
+    base = SUMMARY_LLM_BACKOFF_SECONDS * (2**attempt)
+    return min(30.0, base) + random.uniform(0, 0.5)
+
+
+def _chat(
+    messages: list[dict[str, str]],
+    max_tokens: int = 2200,
+    should_cancel: Callable[[], bool] | None = None,
+) -> str:
     if not SUMMARY_ENABLED:
         raise AppError(
             "SUMMARY_NOT_CONFIGURED",
@@ -562,43 +645,103 @@ def _chat(messages: list[dict[str, str]], max_tokens: int = 2200) -> str:
     url = f"{SUMMARY_API_BASE}/chat/completions"
     if SUMMARY_API_BASE.endswith("/chat/completions"):
         url = SUMMARY_API_BASE
-    try:
-        with httpx.Client(timeout=SUMMARY_TIMEOUT_SECONDS) as client:
-            response = client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {SUMMARY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": SUMMARY_MODEL,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": max_tokens,
-                },
-            )
-    except httpx.HTTPError as exc:
-        raise AppError("SUMMARY_API_ERROR", "AI 服务连接失败，请稍后重试。", 502) from exc
 
-    if response.status_code >= 400:
-        logger.warning("Summary API error %s: %s", response.status_code, response.text[:500])
-        raise AppError("SUMMARY_API_ERROR", f"AI 服务返回错误（{response.status_code}），请稍后重试。", 502)
-    try:
-        payload = response.json()
-        choice = payload["choices"][0]
-        message = choice["message"]
-        content = str(message.get("content") or "")
-        if not content.strip():
-            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    attempts = SUMMARY_LLM_RETRIES + 1
+    for attempt in range(attempts):
+        _raise_if_cancelled(should_cancel)
+        response: httpx.Response | None = None
+        try:
+            # Keep one client per call; the LLM concurrency semaphore already
+            # bounds load and avoids sharing connection-pool lifecycle state.
+            with _llm_slots:
+                with httpx.Client(timeout=SUMMARY_TIMEOUT_SECONDS) as client:
+                    response = client.post(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {SUMMARY_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": SUMMARY_MODEL,
+                            "messages": messages,
+                            "temperature": 0.2,
+                            "max_tokens": max_tokens,
+                        },
+                    )
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            if attempt + 1 < attempts:
+                wait = _retry_wait_seconds(attempt)
+                logger.warning(
+                    "Summary API %s, retry %s/%s in %.1fs",
+                    type(exc).__name__,
+                    attempt + 1,
+                    attempts - 1,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+            raise AppError("SUMMARY_API_ERROR", "AI 服务连接失败，请稍后重试。", 502) from exc
+        except httpx.HTTPError as exc:
+            raise AppError("SUMMARY_API_ERROR", "AI 服务连接失败，请稍后重试。", 502) from exc
+
+        _raise_if_cancelled(should_cancel)
+        if response.status_code in _RETRYABLE_STATUS and attempt + 1 < attempts:
+            wait = _retry_wait_seconds(attempt, response)
             logger.warning(
-                "Empty AI content: finish_reason=%s message_keys=%s reasoning_chars=%s",
-                choice.get("finish_reason"),
-                list(message.keys()),
-                len(str(reasoning)),
+                "Summary API HTTP %s, retry %s/%s in %.1fs",
+                response.status_code,
+                attempt + 1,
+                attempts - 1,
+                wait,
             )
-        return content
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise AppError("SUMMARY_API_ERROR", "AI 服务返回内容无法读取，请稍后重试。", 502) from exc
+            time.sleep(wait)
+            continue
+
+        if response.status_code >= 400:
+            logger.warning(
+                "Summary API error %s: %s", response.status_code, response.text[:500]
+            )
+            suffix = (
+                f"（已重试 {attempt} 次）" if attempt else ""
+            )
+            raise AppError(
+                "SUMMARY_API_ERROR",
+                f"AI 服务返回错误（{response.status_code}）{suffix}，请稍后重试。",
+                502,
+            )
+
+        try:
+            payload = response.json()
+            choice = payload["choices"][0]
+            message = choice["message"]
+            content = str(message.get("content") or "")
+            if not content.strip():
+                reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+                logger.warning(
+                    "Empty AI content: finish_reason=%s message_keys=%s reasoning_chars=%s",
+                    choice.get("finish_reason"),
+                    list(message.keys()),
+                    len(str(reasoning)),
+                )
+            return content
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise AppError(
+                "SUMMARY_API_ERROR", "AI 服务返回内容无法读取，请稍后重试。", 502
+            ) from exc
+
+    raise AppError("SUMMARY_API_ERROR", "AI 服务暂时不可用，请稍后重试。", 502)
+
+
+def _chat_with_cancel(
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    should_cancel: Callable[[], bool] | None,
+) -> str:
+    """Call the model while staying compatible with tests that monkeypatch _chat."""
+
+    if should_cancel is None:
+        return _chat(messages, max_tokens=max_tokens)
+    return _chat(messages, max_tokens=max_tokens, should_cancel=should_cancel)
 
 
 def _normalize_summary(data: dict[str, Any]) -> dict[str, Any]:
@@ -686,7 +829,9 @@ def _fallback_summary(context: str) -> dict[str, Any] | None:
 def summarize_transcript(
     transcript: str,
     progress: Callable[[float], None],
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    _raise_if_cancelled(should_cancel)
     if len(transcript) > SUMMARY_MAX_CHARS:
         transcript = transcript[:SUMMARY_MAX_CHARS] + "\n[... 后文因长度限制被截断 ...]"
 
@@ -695,9 +840,10 @@ def summarize_transcript(
     if len(chunks) > 1:
         notes: list[str] = []
         for index, chunk in enumerate(chunks[:4]):
+            _raise_if_cancelled(should_cancel)
             progress(20 + index * 12)
             notes.append(
-                _chat(
+                _chat_with_cancel(
                     [
                         {
                             "role": "system",
@@ -706,12 +852,14 @@ def summarize_transcript(
                         {"role": "user", "content": f"片段 {index + 1}：\n{chunk}"},
                     ],
                     max_tokens=2500,
+                    should_cancel=should_cancel,
                 )
             )
         context = "分段笔记：\n" + "\n\n".join(notes)
         if len(chunks) > 4:
             context += "\n\n[后续片段已省略]"
 
+    _raise_if_cancelled(should_cancel)
     progress(70)
     prompt = f"""你是中文视频内容总结助手。请只根据下面提供的字幕/转写内容生成总结，不要补充未出现的信息。
 
@@ -735,7 +883,8 @@ def summarize_transcript(
 字幕/转写内容：
 {context}
 """
-    raw = _chat(
+    _raise_if_cancelled(should_cancel)
+    raw = _chat_with_cancel(
         [
             {
                 "role": "system",
@@ -744,13 +893,16 @@ def summarize_transcript(
             {"role": "user", "content": prompt},
         ],
         max_tokens=6000,
+        should_cancel=should_cancel,
     )
+    _raise_if_cancelled(should_cancel)
     try:
         result = _normalize_summary(_extract_json(raw))
     except AppError as parse_error:
+        _raise_if_cancelled(should_cancel)
         logger.warning("Summary JSON invalid; attempting repair")
         try:
-            repaired = _chat(
+            repaired = _chat_with_cancel(
                 [
                     {
                         "role": "system",
@@ -767,14 +919,18 @@ def summarize_transcript(
                     },
                 ],
                 max_tokens=6000,
+                should_cancel=should_cancel,
             )
             result = _normalize_summary(_extract_json(repaired))
+        except SummaryCancelled:
+            raise
         except AppError:
             fallback = _fallback_summary(context)
             if fallback is None:
                 raise parse_error
             result = fallback
 
+    _raise_if_cancelled(should_cancel)
     progress(95)
     result["model"] = SUMMARY_MODEL
     result["generatedAt"] = int(_now())
@@ -795,6 +951,7 @@ def write_article(
     summary: dict[str, Any],
     title: str,
     progress: Callable[[float], None],
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """把完整转写整理成可读的 Markdown 文章。
 
@@ -802,6 +959,7 @@ def write_article(
     复制和导出。长视频分段整理，避免一次生成把上下文和输出都撑爆。
     """
 
+    _raise_if_cancelled(should_cancel)
     if not SUMMARY_ARTICLE_ENABLED:
         raise AppError(
             "ARTICLE_DISABLED",
@@ -830,12 +988,13 @@ def write_article(
     )
     chunks = _chunk_text(transcript, 9_000)
     if len(chunks) == 1:
+        _raise_if_cancelled(should_cancel)
         prompt = (
             intro
             + chunks[0]
             + "\n\n请输出整理后的完整文章。"
         )
-        raw = _chat(
+        raw = _chat_with_cancel(
             [
                 {
                     "role": "system",
@@ -849,6 +1008,7 @@ def write_article(
                 {"role": "user", "content": prompt},
             ],
             max_tokens=8000,
+            should_cancel=should_cancel,
         )
         if not raw.strip():
             logger.warning("Article single-pass returned empty content")
@@ -856,8 +1016,9 @@ def write_article(
     else:
         parts: list[str] = []
         for index, chunk in enumerate(chunks[:3]):
+            _raise_if_cancelled(should_cancel)
             progress(8 + index * 26)
-            raw = _chat(
+            raw = _chat_with_cancel(
                 [
                     {
                         "role": "system",
@@ -874,6 +1035,7 @@ def write_article(
                     },
                 ],
                 max_tokens=6000,
+                should_cancel=should_cancel,
             )
             if not raw.strip():
                 logger.warning("Article chunk %s returned empty content", index + 1)
@@ -882,6 +1044,7 @@ def write_article(
         if len(chunks) > 3:
             body += "\n\n> 后文因长度限制未整理。"
 
+    _raise_if_cancelled(should_cancel)
     if not body.strip():
         raise AppError("ARTICLE_FORMAT_ERROR", "AI 没有返回可用的整理稿，请重试。", 502)
 
@@ -902,6 +1065,7 @@ class SummaryJob:
     title: str = "未命名视频"
     thumbnail: str | None = None
     platform: str | None = None
+    uploader: str | None = None
     duration: int = 0
     status: str = "queued"
     stage: str = "queued"
@@ -917,26 +1081,45 @@ class SummaryJob:
     error_code: str | None = None
     note_id: str | None = None
     note_writer: NoteWriter | None = None
+    queue_position: int = 0
+    transcribe_queue_position: int = 0
+    started_at: float | None = None
+    finished_at: float | None = None
+    cancel_requested: bool = False
+    article_cancel_requested: bool = False
+    retry_count: int = 0
+    deduped: bool = False
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
     future: Any = None
     article_future: Any = None
 
-    def public(self) -> dict[str, Any]:
-        result = self.result
-        return {
+    def is_active(self) -> bool:
+        return self.status in {"queued", "processing", "cancelling"}
+
+    def public(self, include_result: bool = True) -> dict[str, Any]:
+        can_cancel = (
+            (self.status in {"queued", "processing"} and not self.cancel_requested)
+            or (
+                self.status == "done"
+                and self.article_status == "processing"
+                and not self.article_cancel_requested
+            )
+        )
+        payload: dict[str, Any] = {
             "id": self.id,
+            "url": self.url,
             "status": self.status,
             "stage": self.stage,
             "progress": round(self.progress, 1),
             "title": self.title,
             "thumbnail": self.thumbnail,
             "platform": self.platform,
+            "uploader": self.uploader,
             "duration": self.duration,
             "transcriptSource": self.transcript_source,
             "transcriptAvailable": bool(self.transcript and self.transcript.strip()),
             "transcriptChars": len(self.transcript or ""),
-            "result": result,
             "articleStatus": self.article_status,
             "articleProgress": round(self.article_progress, 1),
             "articleChars": len(self.article or ""),
@@ -944,23 +1127,279 @@ class SummaryJob:
             "noteId": self.note_id,
             "error": self.error,
             "errorCode": self.error_code,
+            "queuePosition": self.queue_position,
+            "transcribeQueuePosition": self.transcribe_queue_position,
+            "canCancel": can_cancel,
+            "canRetry": self.status in {"error", "cancelled"},
+            "deduped": self.deduped,
+            "hasResult": bool(self.result),
+            "tldr": str((self.result or {}).get("tldr") or ""),
+            "retryCount": self.retry_count,
             "createdAt": int(self.created_at),
             "updatedAt": int(self.updated_at),
+            "startedAt": int(self.started_at) if self.started_at else None,
+            "finishedAt": int(self.finished_at) if self.finished_at else None,
         }
+        if include_result:
+            payload["result"] = self.result
+        else:
+            payload["result"] = None
+        return payload
 
 
 class SummaryStore:
-    def __init__(self, library: LibraryStore | None = None) -> None:
+    def __init__(
+        self,
+        library: LibraryStore | None = None,
+        persist_path: Path | None = None,
+    ) -> None:
         self._jobs: dict[str, SummaryJob] = {}
         self._lock = threading.RLock()
+        self._persist_lock = threading.Lock()
         self.library = library or library_store
+        self._active_by_url: dict[str, str] = {}
+        self._persist_path = Path(persist_path) if persist_path is not None else SUMMARY_JOBS_PATH
         self._executor = ThreadPoolExecutor(
             max_workers=SUMMARY_WORKERS, thread_name_prefix="clipdock-summary"
         )
         # 总结先返回，整理稿在后台继续生成；不要占住总结线程。
         self._article_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="clipdock-article"
+            max_workers=SUMMARY_ARTICLE_WORKERS, thread_name_prefix="clipdock-article"
         )
+        self._cleanup_stop = threading.Event()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="clipdock-summary-cleanup",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
+        self._load_persisted()
+
+    # --- persistence -----------------------------------------------------
+    def _job_snapshot(self, job: SummaryJob) -> dict[str, Any]:
+        return {
+            "id": job.id,
+            "url": job.url,
+            "title": job.title,
+            "thumbnail": job.thumbnail,
+            "platform": job.platform,
+            "uploader": job.uploader,
+            "duration": job.duration,
+            "status": job.status,
+            "stage": job.stage,
+            "progress": round(job.progress, 1),
+            "noteId": job.note_id,
+            "error": job.error,
+            "errorCode": job.error_code,
+            "retryCount": job.retry_count,
+            "createdAt": int(job.created_at),
+            "updatedAt": int(job.updated_at),
+            "startedAt": int(job.started_at) if job.started_at else None,
+            "finishedAt": int(job.finished_at) if job.finished_at else None,
+        }
+
+    def _save_persisted(self) -> None:
+        if not SUMMARY_PERSIST_JOBS:
+            return
+        with self._lock:
+            jobs = sorted(
+                self._jobs.values(), key=lambda item: item.updated_at, reverse=True
+            )
+            selected = jobs[:SUMMARY_MAX_JOBS]
+            payload = {
+                "version": 1,
+                "savedAt": int(_now()),
+                "jobs": [self._job_snapshot(job) for job in selected],
+            }
+        try:
+            with self._persist_lock:
+                self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self._persist_path.with_suffix(
+                    self._persist_path.suffix + ".tmp"
+                )
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary.replace(self._persist_path)
+        except OSError as exc:
+            logger.warning("写入总结任务快照失败 %s: %s", self._persist_path, exc)
+
+    def _load_persisted(self) -> None:
+        if not SUMMARY_PERSIST_JOBS or not self._persist_path.is_file():
+            return
+        try:
+            payload = json.loads(self._persist_path.read_text(encoding="utf-8"))
+            records = payload.get("jobs") if isinstance(payload, dict) else None
+            if not isinstance(records, list):
+                return
+        except (OSError, ValueError):
+            logger.warning("读取总结任务快照失败: %s", self._persist_path)
+            return
+
+        with self._lock:
+            for record in records[:SUMMARY_MAX_JOBS]:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                job_id = str(record["id"])
+                if job_id in self._jobs:
+                    continue
+                url = str(record.get("url") or "")
+                if not url:
+                    continue
+                status = str(record.get("status") or "error")
+                if status in {"queued", "processing", "cancelling"}:
+                    status = "error"
+                    error_code = "SUMMARY_INTERRUPTED"
+                    error = "服务重启，任务已中断，请重试。"
+                    finished_at = _now()
+                else:
+                    error_code = record.get("errorCode")
+                    error = record.get("error")
+                    finished_at = record.get("finishedAt")
+                job = SummaryJob(
+                    id=job_id,
+                    url=url,
+                    directory=SUMMARY_DIR / job_id,
+                    title=str(record.get("title") or "未命名视频"),
+                    thumbnail=record.get("thumbnail"),
+                    platform=record.get("platform"),
+                    uploader=record.get("uploader"),
+                    duration=int(record.get("duration") or 0),
+                    status=status,
+                    stage=str(record.get("stage") or status),
+                    progress=float(record.get("progress") or 0),
+                    note_id=record.get("noteId"),
+                    error=error,
+                    error_code=error_code,
+                    retry_count=int(record.get("retryCount") or 0),
+                    created_at=float(record.get("createdAt") or _now()),
+                    updated_at=float(record.get("updatedAt") or _now()),
+                    finished_at=float(finished_at) if finished_at else None,
+                )
+                if status == "done" and job.finished_at is None:
+                    job.finished_at = job.updated_at or job.created_at
+                if status == "done":
+                    cached = load_cached_summary(url)
+                    if cached:
+                        job.result = cached.get("result")
+                        job.transcript = cached.get("transcript") or ""
+                        job.transcript_source = cached.get("transcriptSource")
+                        job.article = cached.get("article") or None
+                        job.article_status = cached.get("articleStatus") or "idle"
+                        job.article_error = cached.get("articleError")
+                        if job.article:
+                            job.article_progress = 100.0
+                if status == "error" and job.note_id:
+                    try:
+                        self.library.update(
+                            job.note_id,
+                            status="error",
+                            error=job.error or "服务重启，任务已中断。",
+                        )
+                    except Exception:  # noqa: BLE001 - snapshot must not block startup
+                        logger.exception("恢复中断任务时更新笔记失败 %s", job.note_id)
+                self._jobs[job.id] = job
+
+    # --- note helpers ----------------------------------------------------
+    def _prepare_note(self, job: SummaryJob, uploader: str | None) -> None:
+        job.uploader = uploader or job.uploader
+        note = self.library.prepare_note(
+            {
+                "title": job.title,
+                "source_url": job.url,
+                "platform": job.platform,
+                "uploader": job.uploader or "",
+                "duration": job.duration,
+                "duration_text": human_duration(job.duration),
+                "thumbnail": job.thumbnail or "",
+                "model": SUMMARY_MODEL,
+            }
+        )
+        writer = NoteWriter(self.library, note)
+        writer.start()
+        job.note_id = str(note["id"])
+        job.note_writer = writer
+
+    def _finish_cached_note(
+        self,
+        job: SummaryJob,
+        cached: dict[str, Any],
+    ) -> None:
+        writer = job.note_writer
+        if writer is None:
+            return
+        transcript = str(cached.get("transcript") or "")
+        source = cached.get("transcriptSource")
+        if transcript.strip():
+            writer.append_transcript(transcript)
+            writer.set_transcript_source(str(source or "cache"))
+        result = cached.get("result")
+        if result:
+            writer.set_summary(result)
+        article = cached.get("article")
+        if article:
+            writer.set_article(str(article))
+            writer.finalize()
+            job.article_status = "done"
+            job.article_progress = 100.0
+        elif not SUMMARY_ARTICLE_ENABLED:
+            writer.finalize()
+
+    def _refresh_positions_locked(self) -> None:
+        queued = sorted(
+            (job for job in self._jobs.values() if job.status == "queued"),
+            key=lambda item: item.created_at,
+        )
+        for index, job in enumerate(queued, start=1):
+            job.queue_position = index
+        for job in self._jobs.values():
+            if job not in queued:
+                job.queue_position = 0
+
+        waiting = sorted(
+            (
+                job
+                for job in self._jobs.values()
+                if job.status == "processing" and job.stage == "waiting_transcription"
+            ),
+            key=lambda item: item.created_at,
+        )
+        for index, job in enumerate(waiting, start=1):
+            job.transcribe_queue_position = index
+        for job in self._jobs.values():
+            if job not in waiting:
+                job.transcribe_queue_position = 0
+
+    def _active_count_locked(self) -> int:
+        return sum(1 for job in self._jobs.values() if job.is_active())
+
+    def _finalize_active(self, job: SummaryJob) -> None:
+        with self._lock:
+            if self._active_by_url.get(job.url) == job.id:
+                self._active_by_url.pop(job.url, None)
+
+    def _check_cancel(self, job: SummaryJob) -> None:
+        if job.cancel_requested:
+            raise SummaryCancelled()
+
+    def _mark_cancelled(self, job: SummaryJob) -> None:
+        writer = job.note_writer
+        if writer is not None:
+            try:
+                writer.cancel("任务已取消，可重新生成。")
+            except Exception:  # noqa: BLE001 - cancellation must still finish
+                logger.exception("标记笔记取消失败 %s", job.id)
+        self._update(
+            job,
+            status="cancelled",
+            stage="cancelled",
+            progress=0.0,
+            error=None,
+            error_code=None,
+            finished_at=_now(),
+        )
+        self._finalize_active(job)
 
     def _prepare_note(self, job: SummaryJob, uploader: str | None) -> None:
         note = self.library.prepare_note(
@@ -1028,26 +1467,39 @@ class SummaryStore:
                 422,
             )
 
-        job = SummaryJob(
-            id=uuid.uuid4().hex,
-            url=url,
-            directory=SUMMARY_DIR / uuid.uuid4().hex,
-            title=(title or "未命名视频")[:240],
-            thumbnail=thumbnail[:2048] if thumbnail else None,
-            platform=(platform or "视频平台")[:80],
-            duration=duration,
-        )
-        try:
-            self._prepare_note(job, uploader)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Create note failed")
-            raise AppError("NOTE_STORAGE_ERROR", "无法创建 Markdown 笔记。", 500) from exc
+        with self._lock:
+            existing_id = self._active_by_url.get(url)
+            if existing_id:
+                existing = self._jobs.get(existing_id)
+                if existing is not None and existing.is_active():
+                    payload = existing.public()
+                    payload["deduped"] = True
+                    return payload
+                self._active_by_url.pop(url, None)
 
+        # Cache hits should never wait behind the active queue.
         cached = load_cached_summary(url)
         if cached:
+            job = SummaryJob(
+                id=uuid.uuid4().hex,
+                url=url,
+                directory=SUMMARY_DIR / uuid.uuid4().hex,
+                title=(title or "未命名视频")[:240],
+                thumbnail=thumbnail[:2048] if thumbnail else None,
+                platform=(platform or "视频平台")[:80],
+                uploader=uploader[:120] if uploader else None,
+                duration=duration,
+            )
+            try:
+                self._prepare_note(job, uploader)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Create note failed")
+                raise AppError("NOTE_STORAGE_ERROR", "无法创建 Markdown 笔记。", 500) from exc
+
             job.status = "done"
             job.stage = "done"
             job.progress = 100.0
+            job.finished_at = _now()
             job.result = cached.get("result")
             job.transcript = cached.get("transcript") or ""
             job.transcript_source = cached.get("transcriptSource")
@@ -1061,29 +1513,62 @@ class SummaryStore:
                 self._jobs[job.id] = job
             if not job.article and SUMMARY_ARTICLE_ENABLED:
                 self._start_article(job)
+            self._save_persisted()
             return job.public()
 
-        transcript_cache = load_cached_transcript(url)
-        if transcript_cache:
-            job.transcript = transcript_cache.get("transcript") or ""
-            job.transcript_source = transcript_cache.get("source")
+        with self._lock:
+            existing_id = self._active_by_url.get(url)
+            if existing_id:
+                existing = self._jobs.get(existing_id)
+                if existing is not None and existing.is_active():
+                    payload = existing.public()
+                    payload["deduped"] = True
+                    return payload
+                self._active_by_url.pop(url, None)
+            if self._active_count_locked() >= SUMMARY_QUEUE_MAX:
+                raise AppError(
+                    "SUMMARY_TOO_BUSY",
+                    f"当前有太多总结任务在跑，最多同时保留 {SUMMARY_QUEUE_MAX} 个，请稍后再试。",
+                    429,
+                )
+            job = SummaryJob(
+                id=uuid.uuid4().hex,
+                url=url,
+                directory=SUMMARY_DIR / uuid.uuid4().hex,
+                title=(title or "未命名视频")[:240],
+                thumbnail=thumbnail[:2048] if thumbnail else None,
+                platform=(platform or "视频平台")[:80],
+                uploader=uploader[:120] if uploader else None,
+                duration=duration,
+            )
+            self._jobs[job.id] = job
+            self._active_by_url[url] = job.id
 
         try:
+            self._prepare_note(job, uploader)
+            transcript_cache = load_cached_transcript(url)
+            if transcript_cache:
+                job.transcript = transcript_cache.get("transcript") or ""
+                job.transcript_source = transcript_cache.get("source")
             job.directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise AppError("SUMMARY_STORAGE_ERROR", "无法创建总结临时目录。", 500) from exc
+        except AppError:
+            with self._lock:
+                self._jobs.pop(job.id, None)
+                self._active_by_url.pop(url, None)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._jobs.pop(job.id, None)
+                self._active_by_url.pop(url, None)
+            logger.exception("Create summary job failed")
+            raise AppError(
+                "SUMMARY_STORAGE_ERROR", "无法创建总结任务，请稍后重试。", 500
+            ) from exc
 
         with self._lock:
-            self._jobs[job.id] = job
             job.future = self._executor.submit(self._run, job)
+        self._save_persisted()
         return job.public()
-
-    def _require(self, job_id: str) -> SummaryJob:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
-            return job
 
     def _update(self, job: SummaryJob, **values: Any) -> None:
         with self._lock:
@@ -1103,6 +1588,10 @@ class SummaryStore:
                 except Exception:  # noqa: BLE001 - writing a draft must not break the job
                     logger.exception("Transcript append failed for %s", job.id)
 
+        def should_cancel() -> bool:
+            return job.cancel_requested
+
+        self._check_cancel(job)
         if job.transcript and job.transcript.strip():
             emit(job.transcript)
             return job.transcript, job.transcript_source or "cache"
@@ -1122,14 +1611,19 @@ class SummaryStore:
                 emit(transcript)
                 return transcript, source
 
+        self._check_cancel(job)
         self._update(job, status="processing", stage="fetching_subtitles", progress=5.0)
-        transcript = fetch_subtitle_text(job.url, job.directory)
+        transcript = fetch_subtitle_text(
+            job.url, job.directory, should_cancel=should_cancel
+        )
+        self._check_cancel(job)
         if transcript:
             self._update(job, transcript_source="subtitle", progress=20.0)
             save_cached_transcript(job.url, transcript, "subtitle")
             emit(transcript)
             return transcript, "subtitle"
 
+        self._check_cancel(job)
         self._update(job, stage="downloading_audio", progress=18.0)
         audio = download_audio_for_summary(
             job.url,
@@ -1139,15 +1633,25 @@ class SummaryStore:
                 stage="downloading_audio",
                 progress=min(40.0, 18 + (float(values.get("progress") or 0) * 0.22)),
             ),
+            should_cancel=should_cancel,
         )
-        self._update(job, stage="transcribing", progress=42.0)
+        self._check_cancel(job)
+        self._update(job, stage="waiting_transcription", progress=42.0)
         transcript = transcribe_audio(
             audio,
             lambda value: self._update(
                 job, stage="transcribing", progress=42 + (value * 0.35)
             ),
             on_segment=emit,
+            should_cancel=should_cancel,
+            on_start=lambda: self._update(
+                job,
+                stage="transcribing",
+                progress=42.0,
+                transcribe_queue_position=0,
+            ),
         )
+        self._check_cancel(job)
         self._update(job, transcript_source="audio", progress=78.0)
         save_cached_transcript(job.url, transcript, "audio")
         return transcript, "audio"
@@ -1161,13 +1665,23 @@ class SummaryStore:
             job.article_status = "processing"
             job.article_progress = max(1.0, job.article_progress)
             job.article_error = None
+            job.article_cancel_requested = False
             job.article_future = self._article_executor.submit(self._run_article, job)
+        self._save_persisted()
 
     def _run(self, job: SummaryJob) -> None:
         writer = job.note_writer
         try:
+            self._check_cancel(job)
+            self._update(
+                job,
+                status="processing",
+                stage="fetching_subtitles",
+                started_at=_now(),
+            )
             on_segment = writer.append_transcript if writer is not None else None
             transcript, source = self._transcript_for(job, on_segment=on_segment)
+            self._check_cancel(job)
             if not transcript.strip():
                 raise AppError("NO_SPEECH", "没有提取到可总结的字幕或语音内容。", 422)
             if writer is not None:
@@ -1186,7 +1700,9 @@ class SummaryStore:
                 lambda value: self._update(
                     job, stage="summarizing", progress=82 + (value * 0.15)
                 ),
+                should_cancel=lambda: job.cancel_requested,
             )
+            self._check_cancel(job)
             if writer is not None:
                 writer.set_summary(result)
             save_cached_summary(job.url, result, transcript, source)
@@ -1199,6 +1715,7 @@ class SummaryStore:
                     result=result,
                     error=None,
                     error_code=None,
+                    finished_at=_now(),
                 )
                 self._start_article(job)
             else:
@@ -1213,33 +1730,60 @@ class SummaryStore:
                     result=result,
                     error=None,
                     error_code=None,
+                    finished_at=_now(),
                 )
+        except SummaryCancelled:
+            logger.info("Summary %s cancelled", job.id)
+            self._mark_cancelled(job)
         except AppError as exc:
             logger.warning("Summary %s failed: %s (%s)", job.id, exc.message, exc.code)
             if writer is not None:
-                writer.fail(exc.message)
-            self._update(job, status="error", error=exc.message, error_code=exc.code)
-        except Exception:  # noqa: BLE001
-            logger.exception("Summary %s crashed", job.id)
-            if writer is not None:
-                writer.fail("AI 总结失败，请稍后重试。")
+                try:
+                    writer.fail(exc.message)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Mark note failed for %s", job.id)
             self._update(
                 job,
                 status="error",
+                stage="error",
+                error=exc.message,
+                error_code=exc.code,
+                finished_at=_now(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Summary %s crashed", job.id)
+            if writer is not None:
+                try:
+                    writer.fail("AI 总结失败，请稍后重试。")
+                except Exception:  # noqa: BLE001
+                    logger.exception("Mark note failed for %s", job.id)
+            self._update(
+                job,
+                status="error",
+                stage="error",
                 error="AI 总结失败，请稍后重试。",
                 error_code="SUMMARY_FAILED",
+                finished_at=_now(),
             )
         finally:
             shutil.rmtree(job.directory, ignore_errors=True)
+            self._finalize_active(job)
+            self._save_persisted()
 
     def _run_article(self, job: SummaryJob) -> None:
         writer = job.note_writer
+
+        def should_cancel() -> bool:
+            return job.article_cancel_requested or job.cancel_requested
+
         if not job.transcript or not job.result:
             message = "没有可整理的转写内容。"
             if writer is not None:
                 writer.set_article_error(message)
-                self.library.update(job.note_id or "", status="done", error=message)
+                if job.note_id:
+                    self.library.update(job.note_id, status="done", error=message)
             self._update(job, article_status="error", article_error=message)
+            self._save_persisted()
             return
         try:
             self._update(
@@ -1256,7 +1800,10 @@ class SummaryStore:
                     job,
                     article_progress=max(3.0, min(99.0, value)),
                 ),
+                should_cancel=should_cancel,
             )
+            if should_cancel():
+                raise SummaryCancelled()
             if writer is not None:
                 writer.set_article(article)
                 writer.finalize()
@@ -1268,6 +1815,18 @@ class SummaryStore:
                 article_error=None,
             )
             save_cached_article(job.url, article)
+        except SummaryCancelled:
+            message = "整理稿生成已取消。"
+            if writer is not None:
+                writer.set_article_error(message)
+                if job.note_id:
+                    self.library.update(job.note_id, status="done", error=message)
+            self._update(
+                job,
+                article_status="cancelled",
+                article_error=message,
+                article_progress=0.0,
+            )
         except AppError as exc:
             logger.warning("Article %s failed: %s (%s)", job.id, exc.message, exc.code)
             if writer is not None:
@@ -1297,50 +1856,262 @@ class SummaryStore:
                 article_error=message,
                 article_progress=0.0,
             )
+        finally:
+            self._save_persisted()
 
     def get(self, job_id: str) -> dict[str, Any]:
-        return self._require(job_id).public()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
+            self._refresh_positions_locked()
+            return job.public()
+
+    def list_jobs(
+        self,
+        *,
+        ids: list[str] | None = None,
+        status: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        self._cleanup_once()
+        wanted = set(ids or [])
+        with self._lock:
+            jobs = list(self._jobs.values())
+            if wanted:
+                jobs = [job for job in jobs if job.id in wanted]
+            if status == "active":
+                jobs = [job for job in jobs if job.is_active()]
+            elif status:
+                jobs = [job for job in jobs if job.status == status]
+            jobs.sort(key=lambda job: job.updated_at, reverse=True)
+            limit = max(1, min(100, int(limit or 50)))
+            jobs = jobs[:limit]
+            self._refresh_positions_locked()
+            active = self._active_count_locked()
+            queued = sum(
+                1 for job in self._jobs.values() if job.status == "queued"
+            )
+            items = [job.public(include_result=False) for job in jobs]
+        return {
+            "items": items,
+            "active": active,
+            "queued": queued,
+            "maxActive": SUMMARY_WORKERS,
+            "maxQueue": SUMMARY_QUEUE_MAX,
+        }
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
+
+            if job.status == "done":
+                if (
+                    job.article_status == "processing"
+                    and not job.article_cancel_requested
+                ):
+                    job.article_cancel_requested = True
+                    job.updated_at = _now()
+                    self._save_persisted()
+                    return job.public()
+                raise AppError(
+                    "SUMMARY_NOT_CANCELLABLE", "这个任务已经结束，不能取消。", 409
+                )
+
+            if job.status in {"error", "cancelled"}:
+                raise AppError(
+                    "SUMMARY_NOT_CANCELLABLE", "这个任务已经结束，不能取消。", 409
+                )
+            if job.cancel_requested or job.status == "cancelling":
+                return job.public()
+
+            job.cancel_requested = True
+            job.updated_at = _now()
+            if job.status == "queued" and job.future is not None and job.future.cancel():
+                self._mark_cancelled(job)
+            else:
+                job.status = "cancelling"
+                job.stage = "cancelling"
+            self._save_persisted()
+            return job.public()
+
+    def retry(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
+            if job.status not in {"error", "cancelled"}:
+                raise AppError(
+                    "SUMMARY_NOT_RETRYABLE",
+                    "只有失败或已取消的任务可以重试。",
+                    409,
+                )
+            job.status = "queued"
+            job.stage = "queued"
+            job.progress = 0.0
+            job.error = None
+            job.error_code = None
+            job.result = None
+            job.article = None
+            job.article_status = "idle"
+            job.article_progress = 0.0
+            job.article_error = None
+            job.cancel_requested = False
+            job.article_cancel_requested = False
+            job.started_at = None
+            job.finished_at = None
+            job.updated_at = _now()
+            job.retry_count += 1
+            job.deduped = False
+            self._active_by_url[job.url] = job.id
+
+        try:
+            self._prepare_note(job, job.uploader)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Retry preparation failed for %s", job.id)
+            with self._lock:
+                job.status = "error"
+                job.stage = "error"
+                job.error = "无法重新创建任务笔记，请稍后重试。"
+                job.error_code = "NOTE_STORAGE_ERROR"
+                self._active_by_url.pop(job.url, None)
+            self._save_persisted()
+            raise AppError(
+                "NOTE_STORAGE_ERROR", "无法重新创建任务笔记，请稍后重试。", 500
+            ) from exc
+
+        with self._lock:
+            job.future = self._executor.submit(self._run, job)
+        self._save_persisted()
+        return self.get(job.id)
 
     def request_article(self, job_id: str) -> dict[str, Any]:
-        job = self._require(job_id)
-        if job.status != "done" or not job.result:
-            raise AppError("SUMMARY_NOT_READY", "先等总结完成，再生成整理稿。", 409)
-        if not SUMMARY_ARTICLE_ENABLED:
-            raise AppError("ARTICLE_DISABLED", "完整文案整理没有启用。", 503)
-        if job.article_status != "done":
-            with self._lock:
-                job.article_status = "idle"
-                job.article_error = None
-            self._start_article(job)
-        return job.public()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
+            if job.status != "done" or not job.result:
+                raise AppError("SUMMARY_NOT_READY", "先等总结完成，再生成整理稿。", 409)
+            if not SUMMARY_ARTICLE_ENABLED:
+                raise AppError("ARTICLE_DISABLED", "完整文案整理没有启用。", 503)
+            if job.article_status == "done":
+                return job.public()
+            job.article_status = "idle"
+            job.article_error = None
+            job.article_progress = 0.0
+            job.article_cancel_requested = False
+        self._start_article(job)
+        self._save_persisted()
+        return self.get(job.id)
 
     def article(self, job_id: str) -> dict[str, Any]:
-        job = self._require(job_id)
-        return {
-            "id": job.id,
-            "status": job.article_status,
-            "progress": round(job.article_progress, 1),
-            "article": job.article,
-            "chars": len(job.article or ""),
-            "error": job.article_error,
-        }
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
+            return {
+                "id": job.id,
+                "status": job.article_status,
+                "progress": round(job.article_progress, 1),
+                "article": job.article,
+                "chars": len(job.article or ""),
+                "error": job.article_error,
+            }
 
     def transcript(self, job_id: str) -> dict[str, Any]:
-        job = self._require(job_id)
-        return {
-            "id": job.id,
-            "source": job.transcript_source,
-            "chars": len(job.transcript or ""),
-            "transcript": job.transcript or "",
-        }
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise AppError("SUMMARY_NOT_FOUND", "总结任务不存在或已过期。", 404)
+            return {
+                "id": job.id,
+                "source": job.transcript_source,
+                "chars": len(job.transcript or ""),
+                "transcript": job.transcript or "",
+            }
 
     def count(self) -> int:
         with self._lock:
             return len(self._jobs)
 
+    def count_active(self) -> int:
+        with self._lock:
+            return self._active_count_locked()
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "active": self._active_count_locked(),
+                "queued": sum(
+                    1 for job in self._jobs.values() if job.status == "queued"
+                ),
+                "workers": SUMMARY_WORKERS,
+                "transcribeWorkers": SUMMARY_TRANSCRIBE_WORKERS,
+                "llmConcurrency": SUMMARY_LLM_CONCURRENCY,
+            }
+
+    def _cleanup_loop(self) -> None:
+        while not self._cleanup_stop.wait(60):
+            try:
+                self._cleanup_once()
+            except Exception:  # noqa: BLE001
+                logger.exception("Summary cleanup pass failed")
+
+    def _cleanup_once(self) -> None:
+        cutoff = _now() - SUMMARY_JOB_TTL_SECONDS
+        removed = False
+        with self._lock:
+            expired = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if not job.is_active() and job.updated_at < cutoff
+            ]
+            for job_id in expired:
+                self._jobs.pop(job_id, None)
+                removed = True
+            if len(self._jobs) > SUMMARY_MAX_JOBS:
+                terminal = sorted(
+                    (
+                        job
+                        for job in self._jobs.values()
+                        if not job.is_active()
+                    ),
+                    key=lambda job: job.updated_at,
+                )
+                for job in terminal[: max(0, len(self._jobs) - SUMMARY_MAX_JOBS)]:
+                    self._jobs.pop(job.id, None)
+                    removed = True
+            known = {job.directory.name for job in self._jobs.values()}
+        if removed:
+            self._save_persisted()
+        try:
+            for child in SUMMARY_DIR.iterdir():
+                if not child.is_dir() or child.name in known:
+                    continue
+                try:
+                    if child.stat().st_mtime < cutoff:
+                        shutil.rmtree(child, ignore_errors=True)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
     def shutdown(self) -> None:
+        with self._lock:
+            for job in self._jobs.values():
+                if job.is_active():
+                    job.status = "error"
+                    job.stage = "error"
+                    job.error = "服务已停止，任务已中断，请重试。"
+                    job.error_code = "SUMMARY_INTERRUPTED"
+                    job.finished_at = _now()
+            self._save_persisted()
+        self._cleanup_stop.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._article_executor.shutdown(wait=False, cancel_futures=True)
+        self._cleanup_thread.join(timeout=1)
 
 
 def whisper_available() -> bool:

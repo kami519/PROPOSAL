@@ -94,25 +94,51 @@ function hostMatchesVideoPlatform(value: string): boolean {
   }
 }
 
+function normalizeCandidate(value: string): string {
+  const withScheme = /^https?:\/\//i.test(value) ? value : `https://${value}`
+  try {
+    const parsed = new URL(withScheme)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return value
+    return parsed.toString()
+  } catch {
+    return value
+  }
+}
+
+function collectVideoUrls(text: string): string[] {
+  if (!text || !text.trim()) return []
+
+  // A full URL also matches the bare-domain regex. Normalize both forms to the
+  // same absolute URL before deduplicating, otherwise batch mode sees every
+  // pasted link twice.
+  const candidates = new Map<string, string>()
+  const add = (raw: string) => {
+    const cleaned = cleanCandidate(raw)
+    if (!isLikelyUrl(cleaned)) return
+    const normalized = normalizeCandidate(cleaned)
+    if (!candidates.has(normalized)) candidates.set(normalized, normalized)
+  }
+  for (const match of text.matchAll(URL_IN_TEXT)) add(match[0])
+  for (const match of text.matchAll(BARE_URL_IN_TEXT)) add(match[0])
+  return [...candidates.values()]
+}
+
+/**
+ * Pull all usable video URLs out of arbitrary clipboard / share text while
+ * preserving their order and removing duplicates. Batch summary uses this to
+ * accept a whole pasted list at once.
+ */
+export function extractVideoUrls(text: string): string[] {
+  return collectVideoUrls(text)
+}
+
 /**
  * Pull the first usable video URL out of arbitrary clipboard / share text.
  * Supports both full `https://...` URLs and bare `b23.tv/...` style links.
  */
 export function extractVideoUrl(text: string): string | null {
-  if (!text || !text.trim()) return null
-
-  const candidates = new Set<string>()
-  for (const match of text.matchAll(URL_IN_TEXT)) {
-    const cleaned = cleanCandidate(match[0])
-    if (isLikelyUrl(cleaned)) candidates.add(cleaned)
-  }
-  for (const match of text.matchAll(BARE_URL_IN_TEXT)) {
-    const cleaned = cleanCandidate(match[0])
-    if (isLikelyUrl(cleaned)) candidates.add(cleaned)
-  }
-
-  if (candidates.size === 0) return null
-  const all = [...candidates]
+  const all = collectVideoUrls(text)
+  if (all.length === 0) return null
   return all.find(hostMatchesVideoPlatform) ?? all[0]
 }
 

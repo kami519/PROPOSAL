@@ -11,6 +11,10 @@ class AppError(Exception):
         self.status_code = status_code
 
 
+class SummaryCancelled(Exception):
+    """Raised at a cooperative checkpoint when a summary job is cancelled."""
+
+
 class DownloadInterrupted(Exception):
     """Base class for cooperative pause/cancel of a running download."""
 

@@ -304,6 +304,14 @@ export function Downloader({
     }
   }
 
+  const handleContinue = useCallback(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    window.setTimeout(() => {
+      inputRef.current?.focus()
+      inputRef.current?.select()
+    }, 320)
+  }, [])
+
   const busy = phase === 'analyzing' || phase === 'downloading'
 
   return (
@@ -394,6 +402,7 @@ export function Downloader({
             onRetry={handleRetry}
             onSave={() => job && triggerBrowserDownload(job)}
             onClose={reset}
+            onContinue={handleContinue}
           />
         )}
       </div>

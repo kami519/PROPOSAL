@@ -5,11 +5,18 @@ import { Header } from './components/Header'
 import { Hero } from './components/Hero'
 import { PlatformIndex } from './components/PlatformIndex'
 import { LibraryPage } from './pages/LibraryPage'
+import { TaskCenterPage } from './pages/TaskCenterPage'
+import { TaskDetailPage } from './pages/TaskDetailPage'
 
-type Route = { view: 'home' } | { view: 'library'; noteId?: string }
+type Route =
+  | { view: 'home' }
+  | { view: 'library'; noteId?: string }
+  | { view: 'tasks'; taskId?: string }
 
 function readRoute(): Route {
   const hash = window.location.hash || ''
+  const tasksMatch = /^#\/tasks(?:\/([^/?]+))?/.exec(hash)
+  if (tasksMatch) return { view: 'tasks', taskId: tasksMatch[1] }
   const match = /^#\/library(?:\/([^/?]+))?/.exec(hash)
   if (match) return { view: 'library', noteId: match[1] }
   return { view: 'home' }
@@ -26,6 +33,26 @@ export default function App() {
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
+
+  if (route.view === 'tasks') {
+    return (
+      <div className="page tasks-shell" id="top">
+        <a className="skip-link" href="#tasks-main">
+          跳到任务中心
+        </a>
+        <div className="noise" aria-hidden="true" />
+        <Header />
+        <main id="tasks-main">
+          {route.taskId ? (
+            <TaskDetailPage taskId={route.taskId} />
+          ) : (
+            <TaskCenterPage />
+          )}
+        </main>
+        <Footer />
+      </div>
+    )
+  }
 
   if (route.view === 'library') {
     return (

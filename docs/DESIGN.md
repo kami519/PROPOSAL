@@ -129,7 +129,7 @@ downloading → processing → done
 | `backend/downloader.py` | yt-dlp 封装、格式提示解析、ffmpeg 合并、错误映射 | yt-dlp、imageio-ffmpeg、配置 | 视频 URL、画质档位、临时目录 | 元数据、输出文件、进度事件 |
 | `backend/formats.py` | 从 formats 构建 720P/1080P/最高画质/音频档位，生成 selector | 无 | yt-dlp info | 画质档位、最高高度 |
 | `backend/jobs.py` | 内存任务表、线程池、进度、暂停/取消、文件路径、TTL 清理 | 下载器、配置 | 任务创建请求 | 任务状态、文件句柄 |
-| `backend/summary.py` | 字幕提取、音频转写、LLM 总结 | 下载器、faster-whisper、httpx、配置 | 视频 URL、元数据 | 完整结构化总结、进度、错误 |
+| `backend/summary.py` | 字幕提取、音频转写、并行调度、取消/重试、任务快照、LLM 总结 | 下载器、faster-whisper、httpx、配置 | 视频 URL、元数据 | 完整结构化总结、进度、错误、任务状态 |
 | `backend/security.py` | URL 规范化、SSRF 防护 | 配置 | URL | 安全 URL |
 | `backend/config.py` | 环境变量、临时目录、大小/时长限制 | 无 | 环境变量 | 运行配置 |
 | `backend/errors.py` | 稳定的用户错误码与消息 | 无 | 业务异常 | API 错误响应 |
@@ -140,9 +140,16 @@ downloading → processing → done
 | --- | --- |
 | `components/Hero.tsx` | 首屏文案、下载入口、装饰性收片回执 |
 | `components/Downloader.tsx` | 剪贴板提取、解析状态、结果卡片、画质选择、下载轮询、暂停/取消 |
-| `components/SummaryPanel.tsx` | AI 总结入口、进度、结构化结果 |
+| `components/SummaryPanel.tsx` | AI 总结入口，接入全局任务上下文 |
+| `components/SummaryTaskView.tsx` | 总结进度、结构化结果、完整文案共用视图 |
+| `components/TaskCard.tsx` | 任务中心卡片、取消/重试入口 |
+| `components/BatchSummary.tsx` | 批量链接输入与入队 |
+| `pages/TaskCenterPage.tsx` | 并行任务中心 |
+| `pages/TaskDetailPage.tsx` | 单个任务详情 |
+| `context/SummaryQueueContext.tsx` | 全局任务注册表、轮询、localStorage、通知 |
 | `context/ToastContext.tsx` | 复制、成功、失败等轻提示 |
 | `lib/api.ts` | API 客户端、错误解析、任务请求 |
+| `lib/summary.ts` | 阶段/状态文案、任务活跃判断、总结 Markdown |
 | `lib/format.ts` | 链接提取、URL 校验、高度/大小/时长格式化 |
 | `lib/types.ts` | 前后端共享的前端类型 |
 | `index.css` | 设计令牌、组件样式、响应式和动效 |
@@ -201,8 +208,11 @@ flowchart TD
 | `POST /api/jobs/{id}/resume` | 后端 | 前端 | 从分片继续下载 | 任务编号 | 恢复后的任务状态 |
 | `POST /api/jobs/{id}/cancel` | 后端 | 前端 | 取消并清理临时文件 | 任务编号 | 取消中/已取消状态 |
 | `GET /api/jobs/{id}/file` | 后端 | 浏览器 | 下载完成文件 | 任务编号 | 文件流 |
-| `POST /api/summaries` | 后端 | 前端 | 创建 AI 总结任务 | URL、元数据 | 总结任务（可命中缓存） |
+| `GET /api/summaries` | 后端 | 前端 | 任务列表/轮询 | `ids`、`status`、`limit` | 轻量任务列表、活跃/排队数 |
+| `POST /api/summaries` | 后端 | 前端 | 创建 AI 总结任务 | URL、元数据 | 总结任务（可命中缓存/去重） |
 | `GET /api/summaries/{id}` | 后端 | 前端 | 查询总结进度与结果 | 总结编号 | 阶段、进度、结构化结果、文案状态 |
+| `POST /api/summaries/{id}/cancel` | 后端 | 前端 | 取消任务或文案整理 | 总结编号 | 取消中/已取消状态 |
+| `POST /api/summaries/{id}/retry` | 后端 | 前端 | 重试失败/取消任务 | 总结编号 | 重新排队状态 |
 | `GET /api/summaries/{id}/transcript` | 后端 | 前端/调试 | 原始转写 | 总结编号 | 带时间戳的转写文本与来源 |
 | `GET /api/summaries/{id}/article` | 后端 | 前端 | 查询 AI 完整文案 | 总结编号 | 状态、进度、Markdown 文案 |
 | `POST /api/summaries/{id}/article` | 后端 | 前端 | 生成/重试完整文案 | 总结编号 | 文案任务状态 |
@@ -392,6 +402,14 @@ FastAPI 在启动时托管 `frontend/dist`，API 和页面使用同一个端口�
 | `SUMMARY_API_BASE` | OpenAI 兼容接口地址 |
 | `SUMMARY_API_KEY` | 总结模型密钥；为空时关闭总结 |
 | `SUMMARY_MODEL` | 总结/整理稿模型名称，默认 `deepseek-flash` |
+| `SUMMARY_WORKERS` | 同时推进的总结任务数，默认 3 |
+| `SUMMARY_TRANSCRIBE_WORKERS` | Whisper 并发路数，默认 1 |
+| `SUMMARY_LLM_CONCURRENCY` | LLM 请求总并发，默认 4 |
+| `SUMMARY_ARTICLE_WORKERS` | 文案并行数，默认 2 |
+| `SUMMARY_QUEUE_MAX` | 活跃任务上限，默认 20 |
+| `SUMMARY_JOB_TTL_SECONDS` | 任务中心历史保留时间，默认 24 小时 |
+| `SUMMARY_LLM_RETRIES` | 429/5xx/超时重试次数，默认 2 |
+| `SUMMARY_PERSIST_JOBS` | 是否写任务快照，默认 true |
 | `SUMMARY_MAX_DURATION_SECONDS` | 总结视频最大时长 |
 | `SUMMARY_MAX_CHARS` | 送入总结模型的转写文本上限 |
 | `SUMMARY_ARTICLE_ENABLED` | 是否生成 AI 完整文案 |
@@ -429,7 +447,7 @@ FastAPI 在启动时托管 `frontend/dist`，API 和页面使用同一个端口�
 
 当前验证结果：
 
-- 后端 48 个 pytest 用例通过（含转写缓存、完整文案、缓存命中）。
+- 后端 57 个 pytest 用例通过（含转写缓存、完整文案、缓存命中、并行任务、取消/重试、去重、持久化和限流重试）。
 - B 站 720P 文件：1280×720 H.264 + AAC。
 - B 站 1080P 文件：1920×1080 H.264 + AAC。
 - 4K 样本未配置 cookies 时最高 1080P，页面显示权限提示。
@@ -460,3 +478,55 @@ FastAPI 在启动时托管 `frontend/dist`，API 和页面使用同一个端口�
 7. 本地 Whisper 首次使用需要下载模型，CPU 转写长视频耗时明显。
 8. 总结模型需要 OpenAI 兼容密钥；每次总结都会产生模型调用，请自行控制使用量。
 9. 合并阶段暂停不可用，取消只能在合并结束后完成清理。
+
+## 13. 并行任务与任务中心（Phase 1.4）
+
+### 13.1 并发模型
+
+| 资源 | 默认 | 实现 |
+| --- | --- | --- |
+| 总结任务 | 3 | `ThreadPoolExecutor(max_workers=SUMMARY_WORKERS)` |
+| Whisper 转写 | 1 | 进程级 `BoundedSemaphore(SUMMARY_TRANSCRIBE_WORKERS)`，等待时可取消 |
+| LLM 请求 | 4 | 进程级 `BoundedSemaphore(SUMMARY_LLM_CONCURRENCY)` |
+| 完整文案 | 2 | `ThreadPoolExecutor(max_workers=SUMMARY_ARTICLE_WORKERS)` |
+| 活跃任务 | 20 | 超过 `SUMMARY_QUEUE_MAX` 返回 `SUMMARY_TOO_BUSY` |
+
+LLM 调用对 429、500/502/503/504、超时和连接错误做指数退避 + 抖动重试，优先读取 `Retry-After`。Whisper 解码放在信号量内，避免并行解码放大内存。
+
+### 13.2 任务状态与接口
+
+总结任务状态：`queued / processing / cancelling / cancelled / done / error`。
+阶段：`queued / fetching_subtitles / downloading_audio / waiting_transcription / transcribing / summarizing / done / error / cancelling / cancelled`。
+文案状态独立：`idle / processing / done / error / cancelled`。
+
+新增接口：
+
+- `GET /api/summaries?ids=&status=&limit=`：轻量列表，不返回完整 `result`。
+- `POST /api/summaries/{id}/cancel`：协作式取消；已完成但文案仍在生成时只取消文案。
+- `POST /api/summaries/{id}/retry`：原地重置失败/取消的任务，复用转写缓存。
+
+`SummaryJob.public()` 增加 `url / uploader / queuePosition / transcribeQueuePosition / canCancel / canRetry / deduped / retryCount / startedAt / finishedAt / hasResult / tldr`。
+
+### 13.3 去重、缓存与持久化
+
+- `_active_by_url` 保证同一 URL 只有一个活跃任务；重复创建返回已有任务并标记 `deduped=true`。
+- 命中总结缓存时直接返回 `done`，不占队列；命中转写缓存时跳过下载/转写。
+- 任务元数据写入 `data/cache/summary-jobs.json`；只在创建、终态、取消、重试、关闭时写入，不按进度写盘。
+- 启动时读取快照：运行中任务标记 `SUMMARY_INTERRUPTED` 并同步笔记错误；已完成任务从 `summary-cache` 恢复结果。
+- 清理线程每 60 秒删除超过 TTL 的终态任务和孤儿临时目录。
+
+### 13.4 前端结构
+
+- `SummaryQueueProvider` 全局持有任务，统一轮询 `GET /api/summaries?ids=...`，并把 ID 和展示信息写入 localStorage。
+- `SummaryPanel` 不再自己轮询；关闭面板只隐藏，任务继续。
+- `#/tasks` 任务中心：批量粘贴、统计、筛选、任务卡片、取消/重试/清理。
+- `#/tasks/{id}` 任务详情：进度、总结、完整文案、笔记链接、取消/重试。
+- 完成时 Toast + 标题角标；可选桌面通知（localhost/HTTPS）。
+- 批量先并行解析（最多 3 条），解析完一条入队一条；完整 URL 和裸域名归一化后去重。
+
+### 13.5 已知取舍
+
+- 批量解析阶段需要页面保持打开；入队后可以关闭。
+- 总结线程在等待 Whisper 信号量时会占一个任务槽；默认 3 路仍可让字幕类任务并行，后续可拆阶段队列。
+- 取消无法中断已发出的 LLM HTTP 请求，最长等待一个请求超时。
+- 任务快照不存完整 result；缓存过期时任务卡片保留笔记链接。

@@ -55,6 +55,7 @@ def test_health():
     data = response.json()
     assert data["ok"] is True
     assert data["ytDlpVersion"]
+    assert data["summaryWorkers"] >= 1
 
 
 def test_analyze_with_mocked_downloader(monkeypatch):
@@ -87,6 +88,42 @@ def test_summary_requires_configuration(monkeypatch):
     )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "SUMMARY_NOT_CONFIGURED"
+
+
+def test_summary_list_and_control_routes(monkeypatch):
+    calls = []
+
+    def fake_list(**kwargs):
+        calls.append(("list", kwargs))
+        return {
+            "items": [{"id": "s1", "status": "done"}],
+            "active": 0,
+            "queued": 0,
+            "maxActive": 3,
+            "maxQueue": 20,
+        }
+
+    def fake_cancel(job_id):
+        calls.append(("cancel", job_id))
+        return {"id": job_id, "status": "cancelled"}
+
+    def fake_retry(job_id):
+        calls.append(("retry", job_id))
+        return {"id": job_id, "status": "queued"}
+
+    monkeypatch.setattr(summary_module.summary_store, "list_jobs", fake_list)
+    monkeypatch.setattr(summary_module.summary_store, "cancel", fake_cancel)
+    monkeypatch.setattr(summary_module.summary_store, "retry", fake_retry)
+
+    client = _client()
+    listing = client.get("/api/summaries?ids=s1,s2&status=done&limit=10").json()
+    assert listing["items"][0]["id"] == "s1"
+    assert calls[0] == (
+        "list",
+        {"ids": ["s1", "s2"], "status": "done", "limit": 10},
+    )
+    assert client.post("/api/summaries/s1/cancel").json()["status"] == "cancelled"
+    assert client.post("/api/summaries/s1/retry").json()["status"] == "queued"
 
 
 def test_summary_article_routes(monkeypatch):

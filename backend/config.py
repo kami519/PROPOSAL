@@ -21,6 +21,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _env_path(name: str) -> Path | None:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -68,7 +78,24 @@ ALLOWED_FORMATS = {"720p", "1080p", "best", "audio"}
 SUMMARY_API_BASE = os.getenv("SUMMARY_API_BASE", "https://api.deepseek.com/v1").rstrip("/")
 SUMMARY_API_KEY = os.getenv("SUMMARY_API_KEY", "").strip()
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "deepseek-flash").strip()
-SUMMARY_WORKERS = max(1, _env_int("SUMMARY_WORKERS", 1))
+# Summary jobs advance through network-heavy and CPU-heavy stages. Keep the
+# task-level concurrency separate from the Whisper and LLM limits so a slow
+# local transcription cannot block every other summary.
+SUMMARY_WORKERS = max(1, _env_int("SUMMARY_WORKERS", 3))
+SUMMARY_TRANSCRIBE_WORKERS = max(1, _env_int("SUMMARY_TRANSCRIBE_WORKERS", 1))
+SUMMARY_LLM_CONCURRENCY = max(1, _env_int("SUMMARY_LLM_CONCURRENCY", 4))
+SUMMARY_ARTICLE_WORKERS = max(1, _env_int("SUMMARY_ARTICLE_WORKERS", 2))
+SUMMARY_QUEUE_MAX = max(1, _env_int("SUMMARY_QUEUE_MAX", 20))
+SUMMARY_JOB_TTL_SECONDS = max(3600, _env_int("SUMMARY_JOB_TTL_SECONDS", 24 * 60 * 60))
+SUMMARY_MAX_JOBS = max(20, _env_int("SUMMARY_MAX_JOBS", 100))
+SUMMARY_LLM_RETRIES = max(0, _env_int("SUMMARY_LLM_RETRIES", 2))
+SUMMARY_LLM_BACKOFF_SECONDS = max(0.1, _env_float("SUMMARY_LLM_BACKOFF_SECONDS", 1.5))
+SUMMARY_PERSIST_JOBS = os.getenv("SUMMARY_PERSIST_JOBS", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 SUMMARY_MAX_DURATION_SECONDS = max(60, _env_int("SUMMARY_MAX_DURATION_SECONDS", 45 * 60))
 SUMMARY_MAX_CHARS = max(2000, _env_int("SUMMARY_MAX_CHARS", 30_000))
 SUMMARY_TIMEOUT_SECONDS = max(10, _env_int("SUMMARY_TIMEOUT_SECONDS", 120))

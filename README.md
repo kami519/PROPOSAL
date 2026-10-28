@@ -17,6 +17,8 @@
 - 下载中暂停 / 继续 / 取消，暂停保留分片续传
 - AI 视频总结：字幕优先，无字幕时本地 Whisper 转写
 - AI 完整文案：把转写整理成带标题、段落和列表的 Markdown 文章，可复制 / 下载
+- **并行任务中心**：批量粘贴多个链接，后台并行总结；关闭面板、刷新页面或服务重启都不会丢任务
+- 任务中心支持查看阶段/进度、取消、重试、打开总结和笔记；同一视频自动去重
 - 结果页阅读模式：左侧总结与文案，右侧 300px 媒体栏放封面、画质、下载进度
 - **笔记仓库**：每次 AI 总结自动生成 Markdown，带 AI 摘要、出处、完整文案和原始转写
 - 仓库支持搜索、预览、多选批量下载 zip、批量删除到回收站
@@ -53,6 +55,7 @@ cd ..
 - [方案设计说明书](docs/DESIGN.md)
 - [产品与技术方案](docs/PROPOSAL.md)
 - [本次优化说明](docs/04-本次优化.md)
+- [并行任务与任务中心方案](docs/05-并行任务与任务中心.md)
 - [文档索引](docs/README.md)
 
 ## 技术栈
@@ -65,7 +68,7 @@ cd ..
 | 合并/转码 | imageio-ffmpeg 自带 ffmpeg |
 | AI 转写 | faster-whisper（本地 CPU） |
 | AI 总结 | OpenAI 兼容接口 |
-| 状态 | 内存 Job Store / Summary Store + 临时目录 |
+| 状态 | 内存 Job Store / Summary Store + 临时目录 + 任务 JSON 快照 |
 
 ## AI 视频总结与完整文案
 
@@ -80,6 +83,18 @@ cd ..
    - 在「完整文案」tab 里阅读、复制或下载 `.md`。
 
 转写、总结和整理稿都会缓存到 `data/cache/`。同一链接第二次打开时直接命中缓存，不再重复下载/转写/调用模型。
+
+### 并行任务中心
+
+打开 `#/tasks`（顶栏「任务中心」）：
+
+1. 每行粘贴一个链接，也可以直接粘贴多段分享文字，最多一次 12 条。
+2. 先并行解析标题、封面和时长，解析完一条就入队一条。
+3. 有字幕的视频可以同时调用模型；无字幕视频按本地 Whisper 并发上限排队，避免 CPU 和内存被打满。
+4. 可以关闭面板、刷新页面，或去首页继续解析下一个视频；任务会在任务中心继续。
+5. 每个任务可以取消、重试、打开总结详情或跳转笔记仓库。
+
+任务和历史记录保存在浏览器 localStorage + 服务端 `data/cache/summary-jobs.json`。服务重启后已完成任务仍可查看，运行中的任务会标记「已中断」并允许重试。批量解析阶段需要页面保持打开；已经入队的任务不受影响。
 
 配置模型：复制 `.env.example` 为 `.env`，至少填写：
 
@@ -103,7 +118,8 @@ SUMMARY_MODEL=deepseek-flash
 
 - **无字幕视频**：本地 Whisper 转写是大头，10 分钟视频在 CPU 上跑几分钟很常见；第一次还会下载模型。
 - **有字幕视频**：一般 3–15 秒出总结；如果仍慢，多半是模型调用或长转写分段。
-- **长转写**：超过 3 万字符会先分段压缩，再生成最终总结，全部串行。
+- **长转写**：超过 3 万字符会先分段压缩，再生成最终总结；单条任务内分段仍串行，但多条任务可以并行。
+- **并发**：默认 3 个总结任务同时推进，Whisper 默认 1 路，文案 2 路，LLM 请求最多 4 路；都可以在 `.env` 调整。
 
 已做的优化：
 
@@ -111,7 +127,9 @@ SUMMARY_MODEL=deepseek-flash
 - 转写、总结、整理稿按 URL + 模型 + prompt 版本缓存，第二次打开秒出。
 - 默认模型 `deepseek-flash`，比旧 `deepseek-chat` 更快、更便宜。
 - 总结先返回，完整文案在后台生成，不阻塞总结阅读。
-- UI 显示字幕 / 音频 / 转写 / 总结阶段；长任务可以留在页面等待。
+- 并行任务中心：批量入队、阶段/队列可见、取消、重试、刷新和服务重启恢复。
+- 同一 URL 正在跑时复用已有任务；429/5xx 自动退避重试。
+- UI 显示字幕 / 音频 / 转写 / 总结阶段；长任务可以留在页面等待或关掉页面。
 - `deepseek-flash` 会使用 reasoning token；总结/文案已加大输出预算，JSON 异常会自动修复一次，仍失败会降级为简要总结而不是直接报错。
 
 ## 笔记仓库
@@ -152,6 +170,16 @@ data/library/2026-10-28-从零开始认识显卡-8f3a.md
 | `SUMMARY_API_BASE` | `https://api.deepseek.com/v1` | OpenAI 兼容接口地址 |
 | `SUMMARY_API_KEY` | 空 | 总结模型密钥；为空时关闭总结 |
 | `SUMMARY_MODEL` | `deepseek-flash` | 总结/整理稿模型名称 |
+| `SUMMARY_WORKERS` | `3` | 同时推进的总结任务数 |
+| `SUMMARY_TRANSCRIBE_WORKERS` | `1` | Whisper 并发路数；CPU 建议 1 |
+| `SUMMARY_LLM_CONCURRENCY` | `4` | LLM 请求总并发上限 |
+| `SUMMARY_ARTICLE_WORKERS` | `2` | 完整文案并行数 |
+| `SUMMARY_QUEUE_MAX` | `20` | 活跃任务上限 |
+| `SUMMARY_JOB_TTL_SECONDS` | `86400` | 任务中心历史保留时间 |
+| `SUMMARY_MAX_JOBS` | `100` | 任务快照最多保留数量 |
+| `SUMMARY_LLM_RETRIES` | `2` | 429/5xx/超时重试次数 |
+| `SUMMARY_LLM_BACKOFF_SECONDS` | `1.5` | 重试退避基数 |
+| `SUMMARY_PERSIST_JOBS` | `true` | 是否写任务快照 |
 | `SUMMARY_MAX_DURATION_SECONDS` | `2700` | 总结视频最大时长 |
 | `SUMMARY_MAX_CHARS` | `30000` | 送入总结模型的转写文本上限 |
 | `SUMMARY_ARTICLE_ENABLED` | `true` | 是否生成 AI 完整文案 |
@@ -192,8 +220,11 @@ data/library/2026-10-28-从零开始认识显卡-8f3a.md
 | `POST` | `/api/jobs/{id}/resume` | 继续下载 |
 | `POST` | `/api/jobs/{id}/cancel` | 取消并清理 |
 | `GET` | `/api/jobs/{id}/file` | 下载完成文件 |
-| `POST` | `/api/summaries` | 创建 AI 总结任务 |
+| `GET` | `/api/summaries` | 任务列表（按 ids/status 过滤，轻量不返回完整 result） |
+| `POST` | `/api/summaries` | 创建 AI 总结任务；同 URL 活跃任务自动去重 |
 | `GET` | `/api/summaries/{id}` | 总结进度、结构化结果、文案状态 |
+| `POST` | `/api/summaries/{id}/cancel` | 取消排队/运行中的任务，或取消文案整理 |
+| `POST` | `/api/summaries/{id}/retry` | 重试失败或已取消的任务 |
 | `GET` | `/api/summaries/{id}/transcript` | 原始转写（带时间戳） |
 | `GET` | `/api/summaries/{id}/article` | AI 完整文案状态与内容 |
 | `POST` | `/api/summaries/{id}/article` | 手动生成 / 重试完整文案 |
@@ -221,6 +252,8 @@ data/library/2026-10-28-从零开始认识显卡-8f3a.md
 - 下载暂停、继续、取消
 - 字幕解析、总结 JSON、完整返回
 - 转写缓存、总结缓存、AI 完整文案
+- 并行任务、同 URL 去重、取消、重试、任务列表
+- 任务快照持久化、429 限流重试、队列上限
 - API 路由与健康检查
 
 前端构建：
@@ -230,20 +263,22 @@ cd frontend
 npm run build
 ```
 
-当前验证：**48 个后端测试通过**，前端类型检查、Vite 构建与 oxlint 通过；Playwright 验证了桌面 / 移动端布局、真实下载、暂停取消、AI 总结、完整文案和 4K 提示。
+当前验证：**57 个后端测试通过**，前端类型检查、Vite 构建与 oxlint 通过；已用 Headless Edge 验证任务中心、任务详情、批量链接识别、单条解析 + 缓存总结和 390px 无横向滚动。
 
 ## 限制
 
 1. 不是 100% 万能。平台登录、地区限制、DRM、直播、私密/付费内容都可能失败。
 2. YouTube 在当前网络需要 cookies，实测 B 站最稳定。
 3. 只下载你拥有版权或已获授权的内容。
-4. 下载任务在内存中，重启会丢失进行中的任务；笔记仓库持久化在 `data/library/`，SQLite 只是可重建索引。临时文件最多保留 30 分钟。
+4. 下载任务在内存中，重启会丢失进行中的任务；总结任务有 localStorage + `data/cache/summary-jobs.json` 快照，重启后已完成任务仍可查看，运行中任务标记中断后可重试。笔记仓库持久化在 `data/library/`，SQLite 只是可重建索引。临时文件最多保留 30 分钟。
 5. 文件先落到服务器再转发给浏览器，默认 4GB 上限。
 6. 局域网 HTTP 地址下浏览器会禁用 `navigator.clipboard`，请长按输入框手动粘贴，或使用 `localhost` / HTTPS。
 7. AI 总结和完整文案需要模型 Key；本地 Whisper 首次使用需要下载模型。
 8. 合并阶段不能暂停，只能取消。
 9. AI 完整文案是二次生成，会额外消耗 token；长视频按段整理，极长转写会被截断。
 10. 整理稿是 AI 改写，可能有个别错字或漏句；重要内容请对照原视频。
+11. 批量总结的「解析标题」阶段需要页面保持打开；已经入队的任务不受影响。
+12. 默认只并行 3 个总结任务、1 路 Whisper；调高并发前请评估 CPU、内存和模型 API 限流。
 
 ## 目录
 
@@ -254,20 +289,24 @@ backend/
   downloader.py   yt-dlp 封装、错误映射、ffmpeg
   formats.py      画质档位与 selector
   jobs.py         内存任务队列、暂停/取消、清理
-  summary.py      字幕/转写、缓存、LLM 总结、AI 完整文案
+  summary.py      字幕/转写、缓存、并行调度、取消/重试、任务快照、LLM 总结
   library.py      Markdown 仓库、SQLite 索引、批量下载/删除
-  note_writer.py  草稿写入、摘要/文案替换、原子落盘
+  note_writer.py  草稿写入、摘要/文案替换、原子落盘、取消状态
   security.py     URL 校验、SSRF 防护
 frontend/
-  src/components  首页、下载器、结果工作台、AI 总结、FAQ
-  src/components/ResultWorkbench.tsx  阅读区 + 媒体栏
-  src/components/MarkdownText.tsx     整理稿 Markdown 渲染
+  src/components  首页、下载器、结果工作台、AI 总结、任务卡片、批量入口
+  src/components/SummaryTaskView.tsx  总结进度/结果/文案共用视图
+  src/components/TaskCard.tsx         任务中心卡片
+  src/components/BatchSummary.tsx     批量链接输入
+  src/pages/TaskCenterPage.tsx        并行任务中心
+  src/pages/TaskDetailPage.tsx        任务详情
   src/pages/LibraryPage.tsx           笔记仓库
-  src/context     Toast
-  src/lib         API、类型、格式化
+  src/context     Toast、SummaryQueue（全局任务轮询/恢复）
+  src/lib         API、类型、格式化、URL 提取、总结状态文案
   src/index.css   设计系统与响应式
   src/workbench.css 结果页阅读模式
   src/library.css 笔记仓库样式
+  src/tasks.css   任务中心与任务详情样式
 data/library/     Markdown 笔记（运行时）
 data/library.sqlite3 可重建索引（运行时）
 docs/             需求、设计、方案与截图

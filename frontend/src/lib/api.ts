@@ -6,6 +6,7 @@ import type {
   JobStatus,
   LibraryList,
   SummaryJob,
+  SummaryListResponse,
   TranscriptPayload,
 } from './types'
 
@@ -142,6 +143,29 @@ export const api = {
 
   getSummary(id: string) {
     return request<SummaryJob>(`/api/summaries/${encodeURIComponent(id)}`)
+  },
+
+  listSummaries(
+    params: { ids?: string[]; status?: string; limit?: number } = {},
+  ) {
+    const search = new URLSearchParams()
+    if (params.ids?.length) search.set('ids', params.ids.join(','))
+    if (params.status) search.set('status', params.status)
+    if (params.limit) search.set('limit', String(params.limit))
+    const query = search.toString()
+    return request<SummaryListResponse>(`/api/summaries${query ? `?${query}` : ''}`)
+  },
+
+  cancelSummary(id: string) {
+    return request<SummaryJob>(`/api/summaries/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+    })
+  },
+
+  retrySummary(id: string) {
+    return request<SummaryJob>(`/api/summaries/${encodeURIComponent(id)}/retry`, {
+      method: 'POST',
+    })
   },
 
   getTranscript(id: string) {

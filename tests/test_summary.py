@@ -121,12 +121,12 @@ def test_summary_store_pipeline_with_subtitles(monkeypatch, tmp_path):
     monkeypatch.setattr(
         summary_module,
         "fetch_subtitle_text",
-        lambda url, directory: "[00:00] 这是字幕内容",
+        lambda url, directory, should_cancel=None: "[00:00] 这是字幕内容",
     )
     monkeypatch.setattr(
         summary_module,
         "summarize_transcript",
-        lambda transcript, progress: {
+        lambda transcript, progress, should_cancel=None: {
             "tldr": "字幕总结",
             "keyPoints": ["一", "二", "三", "四"],
             "chapters": [{"time": "00:00", "title": "开场", "summary": "内容"}],
@@ -137,7 +137,9 @@ def test_summary_store_pipeline_with_subtitles(monkeypatch, tmp_path):
         },
     )
     library = LibraryStore(tmp_path / "library.sqlite3", tmp_path / "library")
-    store = SummaryStore(library=library)
+    store = SummaryStore(
+        library=library, persist_path=tmp_path / "summary-jobs.json"
+    )
     try:
         created = store.create(
             url="https://example.com/video",
@@ -193,7 +195,7 @@ def test_summary_store_caches_transcript_and_article(monkeypatch, tmp_path):
 
     calls = {"fetch": 0}
 
-    def fake_fetch(url, directory):
+    def fake_fetch(url, directory, should_cancel=None):
         calls["fetch"] += 1
         return "[00:00] 这是字幕内容，足够长。"
 
@@ -201,7 +203,7 @@ def test_summary_store_caches_transcript_and_article(monkeypatch, tmp_path):
     monkeypatch.setattr(
         summary_module,
         "summarize_transcript",
-        lambda transcript, progress: {
+        lambda transcript, progress, should_cancel=None: {
             "tldr": "字幕总结",
             "keyPoints": ["一", "二"],
             "chapters": [{"time": "00:00", "title": "开场", "summary": "内容"}],
@@ -214,11 +216,13 @@ def test_summary_store_caches_transcript_and_article(monkeypatch, tmp_path):
     monkeypatch.setattr(
         summary_module,
         "write_article",
-        lambda transcript, summary, title, progress: "# 测试视频\n\n整理后的完整文案。",
+        lambda transcript, summary, title, progress, should_cancel=None: "# 测试视频\n\n整理后的完整文案。",
     )
 
     library = LibraryStore(tmp_path / "library.sqlite3", tmp_path / "library")
-    store = SummaryStore(library=library)
+    store = SummaryStore(
+        library=library, persist_path=tmp_path / "summary-jobs.json"
+    )
     try:
         created = store.create(
             url="https://example.com/cache-video",

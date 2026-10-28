@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowDownToLine,
   Check,
+  ChevronRight,
   Clock3,
   Download,
   Info,
@@ -35,6 +36,7 @@ export function ResultWorkbench({
   onRetry,
   onSave,
   onClose,
+  onContinue,
 }: {
   result: AnalyzeResult
   selected: FormatOption | null
@@ -49,6 +51,7 @@ export function ResultWorkbench({
   onRetry: () => void
   onSave: () => void
   onClose: () => void
+  onContinue: () => void
 }) {
   const isWorking = phase === 'downloading'
   const isDone = phase === 'done'
@@ -73,6 +76,9 @@ export function ResultWorkbench({
               </>
             ) : null}
           </div>
+          <button className="reader-next" type="button" onClick={onContinue}>
+            继续收下一个 <ChevronRight size={13} />
+          </button>
         </div>
         <SummaryPanel key={result.webpageUrl} result={result} variant="reader" />
       </section>

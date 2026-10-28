@@ -27,7 +27,10 @@ from .config import (
     JOBS_DIR,
     SUMMARY_ARTICLE_ENABLED,
     SUMMARY_ENABLED,
+    SUMMARY_LLM_CONCURRENCY,
     SUMMARY_MODEL,
+    SUMMARY_TRANSCRIBE_WORKERS,
+    SUMMARY_WORKERS,
 )
 from .downloader import FFMPEG_PATH, analyze_url, clean_text
 from .errors import AppError
@@ -159,6 +162,10 @@ async def health() -> dict[str, Any]:
         "summaryModel": SUMMARY_MODEL,
         "articleEnabled": SUMMARY_ARTICLE_ENABLED,
         "whisperAvailable": whisper_available(),
+        "summaryActive": summary_store.count_active(),
+        "summaryWorkers": SUMMARY_WORKERS,
+        "transcribeWorkers": SUMMARY_TRANSCRIBE_WORKERS,
+        "llmConcurrency": SUMMARY_LLM_CONCURRENCY,
     }
 
 
@@ -234,6 +241,16 @@ async def get_job_file(job_id: str):
     )
 
 
+@app.get("/api/summaries")
+async def list_summaries(
+    ids: str = "",
+    status: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    id_list = [part.strip() for part in ids.split(",") if part.strip()]
+    return summary_store.list_jobs(ids=id_list, status=status, limit=limit)
+
+
 @app.post("/api/summaries")
 async def create_summary(request: SummaryRequest) -> dict[str, Any]:
     url = normalize_url(request.url)
@@ -250,6 +267,16 @@ async def create_summary(request: SummaryRequest) -> dict[str, Any]:
 @app.get("/api/summaries/{summary_id}")
 async def get_summary(summary_id: str) -> dict[str, Any]:
     return summary_store.get(summary_id)
+
+
+@app.post("/api/summaries/{summary_id}/cancel")
+async def cancel_summary(summary_id: str) -> dict[str, Any]:
+    return summary_store.cancel(summary_id)
+
+
+@app.post("/api/summaries/{summary_id}/retry")
+async def retry_summary(summary_id: str) -> dict[str, Any]:
+    return summary_store.retry(summary_id)
 
 
 @app.get("/api/summaries/{summary_id}/transcript")

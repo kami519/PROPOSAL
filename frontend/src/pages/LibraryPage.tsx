@@ -20,7 +20,7 @@ import type { LibraryNote } from '../lib/types'
 import { MarkdownText } from '../components/MarkdownText'
 import { useToast } from '../context/ToastContext'
 
-type StatusFilter = 'all' | 'done' | 'processing' | 'error' | 'trashed'
+type StatusFilter = 'all' | 'done' | 'processing' | 'error' | 'cancelled' | 'trashed'
 
 function stripFrontmatter(source: string): string {
   return source
@@ -52,6 +52,7 @@ const STATUS_META: Record<string, { label: string; tone: string }> = {
   done: { label: '已完成', tone: 'ok' },
   processing: { label: '整理中', tone: 'working' },
   error: { label: '失败', tone: 'error' },
+  cancelled: { label: '已取消', tone: 'muted' },
   trashed: { label: '回收站', tone: 'muted' },
 }
 
@@ -274,6 +275,7 @@ export function LibraryPage({ initialNoteId }: { initialNoteId?: string }) {
             <option value="done">已完成</option>
             <option value="processing">整理中</option>
             <option value="error">失败</option>
+            <option value="cancelled">已取消</option>
             <option value="trashed">回收站</option>
           </select>
           <select
