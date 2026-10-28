@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 # ClipDock one-click deploy for Ubuntu Server 24.04 (2 vCPU / 4 GB).
+#
+#   sudo bash deploy/deploy.sh              # install/update the app + Nginx
+#   sudo bash deploy/deploy.sh --no-nginx   # app only (BaoTa owns Nginx)
+#
+# Re-running the script is safe: it updates code and dependencies, and never
+# overwrites /opt/clipdock/.env.
 set -euo pipefail
 
 REPO_URL="${CLIPDOCK_REPO:-https://github.com/kami519/PROPOSAL.git}"
 APP_DIR="${CLIPDOCK_DIR:-/opt/clipdock}"
 APP_USER="clipdock"
 PYTHON_BIN="/usr/bin/python3.12"
+SETUP_NGINX=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app-dir) APP_DIR="$2"; shift 2 ;;
     --repo) REPO_URL="$2"; shift 2 ;;
+    --no-nginx|--bt) SETUP_NGINX=0; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -25,7 +33,13 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 log "install system packages"
 apt-get update -y
-apt-get install -y python3.12 python3.12-venv python3-pip git nginx curl ca-certificates nodejs npm
+apt-get install -y python3.12 python3.12-venv python3-pip git curl ca-certificates
+if [[ "$SETUP_NGINX" -eq 1 ]]; then
+  apt-get install -y nginx
+fi
+if ! command -v node >/dev/null 2>&1; then
+  apt-get install -y nodejs npm
+fi
 
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
   log "create service user $APP_USER"
@@ -73,13 +87,18 @@ systemctl daemon-reload
 systemctl enable clipdock
 systemctl restart clipdock
 
-log "configure nginx"
-install -m 644 "$APP_DIR/deploy/nginx-clipdock.conf" /etc/nginx/sites-available/clipdock
-ln -sf /etc/nginx/sites-available/clipdock /etc/nginx/sites-enabled/clipdock
-rm -f /etc/nginx/sites-enabled/default
-nginx -t
-systemctl enable nginx
-systemctl restart nginx
+if [[ "$SETUP_NGINX" -eq 1 ]]; then
+  log "configure nginx (standalone mode)"
+  install -m 644 "$APP_DIR/deploy/nginx-clipdock.conf" /etc/nginx/sites-available/clipdock
+  ln -sf /etc/nginx/sites-available/clipdock /etc/nginx/sites-enabled/clipdock
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t
+  systemctl enable nginx
+  systemctl restart nginx
+else
+  log "skip nginx (managed by BaoTa or by hand)"
+  echo "reverse proxy config: $APP_DIR/deploy/nginx-clipdock.conf"
+fi
 
 log "wait for service"
 for i in $(seq 1 30); do
@@ -96,13 +115,12 @@ echo
 cat <<EOF
 
 Deploy finished.
-  URL      http://<server-ip>/
-  Tasks    http://<server-ip>/#/tasks
-  Config   $APP_DIR/.env
-  Logs     journalctl -u clipdock -f
+  App URL    http://<server-ip>:8000/
+  Tasks      http://<server-ip>:8000/#/tasks
+  Config     $APP_DIR/.env
+  Logs       journalctl -u clipdock -f
 
 Next:
   1. Edit $APP_DIR/.env and fill SUMMARY_API_KEY.
   2. systemctl restart clipdock
-  3. Open port 80 in the cloud firewall / security group.
 EOF
