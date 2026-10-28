@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    DOWNLOAD_CONCURRENCY,
     DOWNLOAD_WORKERS,
     JOBS_DIR,
     JOB_TTL_SECONDS,
@@ -114,6 +115,18 @@ class JobStore:
             )
         if active >= MAX_JOBS:
             raise AppError("TOO_BUSY", "当前排队任务太多，请稍后再试。", 429)
+        if DOWNLOAD_CONCURRENCY:
+            running = sum(
+                1
+                for job in self._jobs.values()
+                if job.status in {"downloading", "processing"}
+            )
+            if running >= DOWNLOAD_CONCURRENCY:
+                raise AppError(
+                    "TOO_BUSY",
+                    "当前已有视频在下载，请等它完成后或暂停后再试。",
+                    429,
+                )
 
     def create(
         self,

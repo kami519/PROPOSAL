@@ -49,6 +49,18 @@ cd ..
 
 打开 <http://127.0.0.1:8000>。手机访问时使用电脑的局域网 IP，例如 `http://192.168.x.x:8000`。
 
+### 部署到 Ubuntu 云服务器
+
+2 核 4G / Ubuntu 24.04 的云服务器可以用 `deploy/` 下的一键脚本部署（systemd + Nginx 反向代理）：
+
+```bash
+sudo apt-get install -y git
+git clone https://github.com/kami519/PROPOSAL.git /opt/clipdock
+cd /opt/clipdock && sudo bash deploy/deploy.sh
+```
+
+详细说明（环境变量、安全组、Whisper 模型、5 Mbps 带宽建议）见 [deploy/README.md](deploy/README.md)。
+
 ## 项目文档
 
 - [需求规格说明书](docs/REQUIREMENTS.md)
@@ -196,7 +208,8 @@ data/library/2026-10-28-从零开始认识显卡-8f3a.md
 | `MAX_FILESIZE_BYTES` | `4294967296` | 单文件最大 4GB |
 | `MIN_FREE_BYTES` | `536870912` | 任务所需的最低磁盘余量 |
 | `JOB_TTL_SECONDS` | `1800` | 临时文件保留 30 分钟 |
-| `DOWNLOAD_WORKERS` | `2` | 并发下载数 |
+| `DOWNLOAD_WORKERS` | `2` | 并发下载线程数 |
+| `DOWNLOAD_CONCURRENCY` | `0` | 同时下载的活跃任务上限；0 不限制，小服务器建议 1 |
 
 服务启动时会自动加载项目根目录的 `.env`；也可以使用进程环境变量。`.env` 已被 `.gitignore` 忽略。
 
@@ -309,6 +322,7 @@ frontend/
   src/tasks.css   任务中心与任务详情样式
 data/library/     Markdown 笔记（运行时）
 data/library.sqlite3 可重建索引（运行时）
+deploy/           Ubuntu 服务器部署脚本、systemd、Nginx 与服务器配置
 docs/             需求、设计、方案与截图
 tests/            pytest
 ```

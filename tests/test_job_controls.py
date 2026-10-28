@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import backend.jobs as jobs_module
+from backend.errors import AppError
 from backend.jobs import JobStore
 
 
@@ -70,3 +71,14 @@ def test_cancel_removes_temporary_directory(store):
     assert cancelled["status"] == "cancelled"
     assert not (jobs_module.JOBS_DIR / job_id).exists()
     assert cancelled["canCancel"] is False
+
+
+def test_download_concurrency_limit_queue(store, monkeypatch):
+    monkeypatch.setattr(jobs_module, "DOWNLOAD_CONCURRENCY", 1)
+    first = store.create(url="https://example.com/a", tier="720p", title="a")
+    _wait_for(store, first["id"], {"downloading"})
+    with pytest.raises(AppError) as caught:
+        store.create(url="https://example.com/b", tier="720p", title="b")
+    assert caught.value.code == "TOO_BUSY"
+    store.cancel(first["id"])
+    _wait_for(store, first["id"], {"cancelled"})

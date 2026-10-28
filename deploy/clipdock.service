@@ -1,0 +1,22 @@
+[Unit]
+Description=ClipDock video downloader and AI summary service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clipdock
+Group=clipdock
+WorkingDirectory=/opt/clipdock
+EnvironmentFile=/opt/clipdock/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+# Whisper 在 2 核 CPU 上要留出稳定性余量。
+LimitNOFILE=65536
+ExecStart=/opt/clipdock/.venv/bin/python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

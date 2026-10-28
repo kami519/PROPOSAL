@@ -63,6 +63,9 @@ MAX_DURATION_SECONDS = _env_int("MAX_DURATION_SECONDS", 2 * 60 * 60)
 MAX_FILESIZE_BYTES = _env_int("MAX_FILESIZE_BYTES", 4 * 1024 * 1024 * 1024)
 MIN_FREE_BYTES = _env_int("MIN_FREE_BYTES", 512 * 1024 * 1024)
 DOWNLOAD_WORKERS = max(1, _env_int("DOWNLOAD_WORKERS", 2))
+# 0 disables the limit. A small cloud instance may only afford one active
+# video download at a time; extra jobs stay queued.
+DOWNLOAD_CONCURRENCY = max(0, _env_int("DOWNLOAD_CONCURRENCY", 0))
 MAX_JOBS = max(4, _env_int("MAX_JOBS", 60))
 JOB_TTL_SECONDS = max(300, _env_int("JOB_TTL_SECONDS", 30 * 60))
 CLEANUP_INTERVAL_SECONDS = max(30, _env_int("CLEANUP_INTERVAL_SECONDS", 60))
